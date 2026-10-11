@@ -9,7 +9,9 @@
 pub(crate) mod color;
 pub(crate) mod curve;
 pub(crate) mod dehaze;
+pub(crate) mod grading;
 pub(crate) mod grain;
 pub(crate) mod hsl;
 pub(crate) mod light;
 pub(crate) mod noise;
+pub(crate) mod vignette;

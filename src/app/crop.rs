@@ -144,6 +144,7 @@ impl TinyLumaApp {
             if self.retouch.active {
                 self.retouch_toggle();
             }
+            self.wb_picker_active = false;
             self.crop.active = true;
             self.crop.session_baseline = Some(self.crop.crop);
             self.crop.session_hist_len = self.history.len();

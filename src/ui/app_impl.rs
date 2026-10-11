@@ -193,6 +193,9 @@ impl eframe::App for TinyLumaApp {
             if ctx.input(|i| i.key_pressed(egui::Key::J)) {
                 self.retouch_toggle();
             }
+            if ctx.input(|i| i.key_pressed(egui::Key::W)) {
+                self.wb_picker_toggle();
+            }
         }
         // Enter applies the crop and leaves; Esc discards everything done in
         // this session and leaves. An open popup (e.g. the ratio dropdown) takes
@@ -207,6 +210,12 @@ impl eframe::App for TinyLumaApp {
                 self.crop_cancel();
             } else if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                 self.crop_toggle();
+            }
+        }
+        // Esc leaves the white-balance picker without changing anything.
+        if self.wb_picker_active && !ctx.wants_keyboard_input() && !self.modal_open() {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.wb_picker_active = false;
             }
         }
 

@@ -239,6 +239,19 @@ impl TinyLumaApp {
                             if d {
                                 self.drag_active = true;
                             }
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Brightness",
+                                &mut self.settings.brightness,
+                                -100.0..=100.0,
+                                def.brightness,
+                            );
+                            if c {
+                                color_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
                         });
                     });
                     if light_open != self.open_groups[0] {
@@ -326,6 +339,19 @@ impl TinyLumaApp {
                             if d {
                                 self.drag_active = true;
                             }
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Hue",
+                                &mut self.settings.hue,
+                                -180.0..=180.0,
+                                def.hue,
+                            );
+                            if c {
+                                color_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
                         });
                     });
                     if color_open != self.open_groups[1] {
@@ -369,6 +395,48 @@ impl TinyLumaApp {
                     });
                     if mixer_open != self.open_mixer_group {
                         self.open_mixer_group = mixer_open;
+                        groups_changed = true;
+                    }
+
+                    ui.add_space(5.0);
+
+                    // --- COLOR GRADING ---
+                    let mut grading_name_clicked = false;
+                    let mut grading_header =
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            ui.make_persistent_id("group_grading"),
+                            self.open_grading_group,
+                        )
+                        .show_header(ui, |ui| {
+                            grading_name_clicked = ui
+                                .add(
+                                    egui::Label::new(format!(
+                                        "{} COLOR GRADING",
+                                        ph::CIRCLE_HALF_TILT
+                                    ))
+                                    .selectable(false)
+                                    .sense(egui::Sense::click()),
+                                )
+                                .clicked();
+                        });
+                    if grading_name_clicked {
+                        grading_header.toggle();
+                    }
+                    let grading_open = grading_header.is_open();
+                    grading_header.body_unindented(|ui| {
+                        ui.group(|ui| {
+                            let (c, d) = self.show_color_grading(ui);
+                            if c {
+                                color_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+                        });
+                    });
+                    if grading_open != self.open_grading_group {
+                        self.open_grading_group = grading_open;
                         groups_changed = true;
                     }
 
@@ -602,6 +670,80 @@ impl TinyLumaApp {
                                 &mut self.settings.grain_size,
                                 0.0..=100.0,
                                 def.grain_size,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Grain Roughness",
+                                &mut self.settings.grain_roughness,
+                                0.0..=100.0,
+                                def.grain_roughness,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+
+                            // --- VIGNETTE subsection (positional, spatial) ---
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!("{} VIGNETTE", ph::CIRCLE))
+                                    .size(11.0)
+                                    .color(theme::TEXT_TERTIARY),
+                            );
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Amount",
+                                &mut self.settings.vignette.amount,
+                                -100.0..=100.0,
+                                def.vignette.amount,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Midpoint",
+                                &mut self.settings.vignette.midpoint,
+                                0.0..=100.0,
+                                def.vignette.midpoint,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Roundness",
+                                &mut self.settings.vignette.roundness,
+                                -100.0..=100.0,
+                                def.vignette.roundness,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Feather",
+                                &mut self.settings.vignette.feather,
+                                0.0..=100.0,
+                                def.vignette.feather,
                             );
                             if c {
                                 spatial_changed = true;

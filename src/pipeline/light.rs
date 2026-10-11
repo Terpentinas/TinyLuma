@@ -59,6 +59,16 @@ const BLACKS_EDGE: f32 = 0.4;
 /// `0` — the slider is off, `1` — canonical strength (matches the legacy
 /// `powf(curve)` in sign and order of magnitude), higher — more aggressive.
 const WB_STRENGTH: f32 = 1.0;
+/// Brightness: strength of the midtone-weighted gamma at the positive maximum.
+///
+/// Fitted numerically against RapidRAW's filmic brightness luma curve by the
+/// calibration kit (`cargo test calibration -- --ignored`). Maps `L = 0.5` to
+/// ≈ 0.69, matching `apply_filmic_exposure`.
+pub(crate) const BRIGHTNESS_STRENGTH_POS: f32 = 0.86;
+/// Brightness: strength at the negative maximum, fitted the same way (maps
+/// `L = 0.5` to ≈ 0.31). Split from the positive side because RapidRAW's
+/// rational curve is asymmetric.
+pub(crate) const BRIGHTNESS_STRENGTH_NEG: f32 = 0.71;
 
 /// Light-panel parameters in internal (normalized) units.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -75,6 +85,8 @@ pub(crate) struct LightSettings {
     pub whites: f32,
     /// Blacks, `-1..=1`.
     pub blacks: f32,
+    /// Brightness (midtone lift), `-1..=1`.
+    pub brightness: f32,
 }
 
 impl LightSettings {
@@ -85,6 +97,7 @@ impl LightSettings {
             && self.shadows.abs() < 1e-6
             && self.whites.abs() < 1e-6
             && self.blacks.abs() < 1e-6
+            && self.brightness.abs() < 1e-6
     }
 }
 
@@ -265,10 +278,47 @@ pub(crate) fn apply_blacks(p: &mut [f32; 3], blacks: f32) {
     p[0] = p[0].powf(gamma);
 }
 
+/// Brightness: a midtone-weighted gamma on `L`.
+///
+/// Unlike [`apply_exposure`] (a linear gain over the whole range), this lifts or
+/// lowers the midtones while pinning black and white. The weight
+/// `w = 4·L·(1−L)` peaks at the middle and vanishes at both endpoints, so
+/// `L = 0` and `L = 1` are fixed (no grey veil on black, no greyness on white).
+/// `γ = 1/(1 + b·w)` for `b > 0` (brighter), `1 + |b|·w` for `b < 0` (darker).
+#[inline]
+pub(crate) fn apply_brightness(p: &mut [f32; 3], amount: f32) {
+    if amount.abs() < 1e-6 || p[0] <= 0.0 {
+        return;
+    }
+    let strength = if amount > 0.0 {
+        BRIGHTNESS_STRENGTH_POS
+    } else {
+        BRIGHTNESS_STRENGTH_NEG
+    };
+    p[0] = brightness_curve(p[0], amount, strength);
+}
+
+/// Brightness response for one lightness value with an explicit strength.
+/// Exposed so the calibration kit can fit [`BRIGHTNESS_STRENGTH`].
+#[inline]
+pub(crate) fn brightness_curve(l: f32, amount: f32, strength: f32) -> f32 {
+    if amount.abs() < 1e-6 || l <= 0.0 {
+        return l;
+    }
+    let w = (4.0 * l * (1.0 - l)).clamp(0.0, 1.0);
+    let gamma = if amount > 0.0 {
+        1.0 / (1.0 + amount * w * strength)
+    } else {
+        1.0 + (-amount) * w * strength
+    };
+    l.powf(gamma)
+}
+
 /// Full Light pass over an Oklab pixel (order is fixed).
 #[inline]
 pub(crate) fn apply_light(p: &mut [f32; 3], s: &LightSettings) {
     apply_exposure(p, s.exposure);
+    apply_brightness(p, s.brightness);
     apply_contrast(p, s.contrast);
     apply_highlights_shadows(p, s.highlights, s.shadows);
     apply_whites(p, s.whites);
@@ -337,6 +387,36 @@ mod tests {
         assert!((p[0] - 0.5 * f).abs() < 1e-6);
         assert!((p[1] - 0.1 * f).abs() < 1e-6);
         assert!((p[2] - -0.05 * f).abs() < 1e-6);
+    }
+
+    #[test]
+    fn brightness_lifts_midtones_and_pins_endpoints() {
+        let mut black = [0.0f32, 0.0, 0.0];
+        let mut dark = [0.15f32, 0.0, 0.0];
+        let mut mid = [0.5f32, 0.0, 0.0];
+        let mut white = [1.0f32, 0.0, 0.0];
+        apply_brightness(&mut black, 1.0);
+        apply_brightness(&mut dark, 1.0);
+        apply_brightness(&mut mid, 1.0);
+        apply_brightness(&mut white, 1.0);
+        assert!(mid[0] > 0.5, "mid lifted: {}", mid[0]);
+        assert!((white[0] - 1.0).abs() < 1e-6, "white pinned: {}", white[0]);
+        assert!(black[0] < 1e-6, "black pinned: {}", black[0]);
+        // The middle moves more than a near-black pixel (midtone weighting).
+        assert!(
+            mid[0] - 0.5 > dark[0] - 0.15,
+            "midtone {} vs dark {}",
+            mid[0] - 0.5,
+            dark[0] - 0.15
+        );
+    }
+
+    #[test]
+    fn brightness_negative_darkens_midtones() {
+        let mut mid = [0.5f32, 0.0, 0.0];
+        apply_brightness(&mut mid, -1.0);
+        // Fitted against RapidRAW's filmic curve.
+        assert!((mid[0] - 0.3057).abs() < 0.01, "expected ~0.31: {}", mid[0]);
     }
 
     #[test]

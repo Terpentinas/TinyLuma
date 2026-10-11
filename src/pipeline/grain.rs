@@ -37,6 +37,10 @@ const GRAIN_SIZE_MIN_CELL: f64 = 0.1;
 const GRAIN_SIZE_MAX_CELL: f64 = 8.0;
 /// Grain strength scale (darktable `GRAIN_LIGHTNESS_STRENGTH_SCALE`).
 const LIGHTNESS_STRENGTH_SCALE: f32 = 0.15;
+/// The Grain Roughness slider mixes in a second, coarser noise field (RapidRAW
+/// uses 0.6× the base spatial frequency). The base `zoom` is inversely
+/// proportional to frequency, so a coarser field means a larger zoom.
+const ROUGH_ZOOM_SCALE: f64 = 1.0 / 0.6;
 /// Size of the response 2D LUT.
 const LUT_SIZE: usize = 128;
 const LUT_N: usize = LUT_SIZE * LUT_SIZE;
@@ -187,6 +191,7 @@ pub(crate) fn grain_zoom(size: f32) -> f64 {
 /// Coordinates are normalized to the short side → the grain size does not depend
 /// on resolution. `size` is the `0..100` grain-size slider ([`grain_zoom`]);
 /// `seed` shifts the field (different grain for different seeds).
+#[cfg(test)]
 pub(crate) fn generate_map(w: usize, h: usize, seed: u64, size: f32) -> Vec<f32> {
     let wd = w.min(h).max(1) as f64;
     let zoom = grain_zoom(size);
@@ -198,6 +203,40 @@ pub(crate) fn generate_map(w: usize, h: usize, seed: u64, size: f32) -> Vec<f32>
         *v = simplex_2d(x + offset, y, zoom) as f32;
     });
     out
+}
+
+/// Generates an interleaved grain map `[base, rough]` per pixel (`2·w·h`
+/// values). The `rough` channel is a coarser, decorrelated field that the Grain
+/// Roughness slider mixes in (`0` = base only). When `with_rough` is `false` the
+/// odd slots stay `0` and are never read with a non-zero roughness.
+pub(crate) fn generate_map_interleaved(
+    w: usize,
+    h: usize,
+    seed: u64,
+    size: f32,
+    with_rough: bool,
+) -> Vec<f32> {
+    let wd = w.min(h).max(1) as f64;
+    let zoom_base = grain_zoom(size);
+    let zoom_rough = zoom_base * ROUGH_ZOOM_SCALE;
+    let off_base = (seed % 100_000) as f64 * 0.137;
+    let off_rough = ((seed + 7) % 100_000) as f64 * 0.137;
+    let mut out = vec![0f32; w * h * 2];
+    out.par_chunks_mut(2).enumerate().for_each(|(i, pair)| {
+        let x = (i % w) as f64 / wd;
+        let y = (i / w) as f64 / wd;
+        pair[0] = simplex_2d(x + off_base, y, zoom_base) as f32;
+        if with_rough {
+            pair[1] = simplex_2d(x + off_rough, y, zoom_rough) as f32;
+        }
+    });
+    out
+}
+
+/// Mixes the base and rough noise channels by the `0..=1` roughness.
+#[inline]
+pub(crate) fn blend_noise(base: f32, rough: f32, roughness: f32) -> f32 {
+    base + (rough - base) * roughness.clamp(0.0, 1.0)
 }
 
 #[inline]
@@ -353,6 +392,54 @@ mod tests {
         );
         assert_ne!(fine, coarse);
     }
+
+    #[test]
+    fn interleaved_map_shape_and_channels() {
+        let plain = generate_map_interleaved(16, 8, 42, 50.0, false);
+        assert_eq!(plain.len(), 16 * 8 * 2);
+        assert!(
+            plain.chunks(2).all(|p| p[1] == 0.0),
+            "rough channel should be empty"
+        );
+        let both = generate_map_interleaved(16, 8, 42, 50.0, true);
+        assert!(
+            both.chunks(2).any(|p| p[1] != 0.0),
+            "rough channel should be filled"
+        );
+        assert_ne!(plain, both);
+    }
+
+    #[test]
+    fn rough_channel_is_coarser() {
+        // The rough field varies more slowly across neighbouring pixels. Use a
+        // coarse grain size (large cells) so both fields are well resolved.
+        let (w, h) = (512usize, 512usize);
+        let m = generate_map_interleaved(w, h, 42, 100.0, true);
+        let roughness = |ch: usize| {
+            let mut sum = 0.0f64;
+            let mut n = 0usize;
+            for y in 0..h {
+                for x in 0..w - 1 {
+                    sum += (m[(y * w + x + 1) * 2 + ch] - m[(y * w + x) * 2 + ch]).abs() as f64;
+                    n += 1;
+                }
+            }
+            sum / n as f64
+        };
+        assert!(
+            roughness(1) < roughness(0),
+            "rough {} vs base {}",
+            roughness(1),
+            roughness(0)
+        );
+    }
+
+    #[test]
+    fn blend_noise_endpoints() {
+        assert_eq!(blend_noise(0.5, -0.3, 0.0), 0.5);
+        assert!((blend_noise(0.5, -0.3, 1.0) - -0.3).abs() < 1e-6);
+        assert!((blend_noise(0.5, -0.3, 0.5) - 0.1).abs() < 1e-6);
+    }
 }
 
 #[cfg(test)]
@@ -367,6 +454,19 @@ mod bench_grain {
         let m = generate_map(1200, 800, 42, 50.0);
         println!(
             "grain map 1200x800: {:.1} ms ({} samples)",
+            t.elapsed().as_secs_f64() * 1000.0,
+            m.len()
+        );
+        std::hint::black_box(m);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_grain_map_1200_rough() {
+        let t = Instant::now();
+        let m = generate_map_interleaved(1200, 800, 42, 50.0, true);
+        println!(
+            "grain map 1200x800 (rough): {:.1} ms ({} samples)",
             t.elapsed().as_secs_f64() * 1000.0,
             m.len()
         );

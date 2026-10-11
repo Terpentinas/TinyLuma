@@ -916,19 +916,34 @@ impl TinyLumaApp {
     }
 
     // Extract grain_map generation into a separate method
-    pub(crate) fn generate_grain_map(w: usize, h: usize, seed: u64, size: f32) -> Vec<f32> {
-        crate::pipeline::grain::generate_map(w, h, seed, size)
+    pub(crate) fn generate_grain_map(
+        w: usize,
+        h: usize,
+        seed: u64,
+        size: f32,
+        with_rough: bool,
+    ) -> Vec<f32> {
+        crate::pipeline::grain::generate_map_interleaved(w, h, seed, size, with_rough)
     }
 
-    /// Regenerates the cached grain map when the frame size or the Grain Size
-    /// slider changed. Cheap to call every frame: it usually does nothing.
+    /// Regenerates the cached grain map when the frame size, the Grain Size or
+    /// the Grain Roughness (on/off) changed. Cheap to call every frame: it
+    /// usually does nothing. The rough channel is only generated while the
+    /// roughness slider is engaged, so a size drag costs no more than before.
     pub(crate) fn ensure_grain_map(&mut self, w: usize, h: usize) {
-        if self.grain_map_dims == (w, h) && self.grain_map_size == self.settings.grain_size {
+        let want_rough = self.settings.grain_roughness > 0.0;
+        let fresh = self.grain_map_dims == (w, h)
+            && self.grain_map_size == self.settings.grain_size
+            && self.grain_map_has_rough == want_rough
+            && !self.grain_map.is_empty();
+        if fresh {
             return;
         }
-        self.grain_map = Self::generate_grain_map(w, h, 42, self.settings.grain_size);
+        self.grain_map =
+            Self::generate_grain_map(w, h, 42, self.settings.grain_size, want_rough);
         self.grain_map_dims = (w, h);
         self.grain_map_size = self.settings.grain_size;
+        self.grain_map_has_rough = want_rough;
     }
 }
 

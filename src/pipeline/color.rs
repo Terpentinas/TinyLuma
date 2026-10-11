@@ -16,6 +16,12 @@ use crate::color::oklab::oklab_to_linear_rgb;
 
 /// Reference temperature (white-balance identity), K.
 pub(crate) const REFERENCE_KELVIN: f32 = 6500.0;
+/// CIE xy of the sRGB / D65 white point — the pipeline's output neutral.
+///
+/// The Planckian locus at [`REFERENCE_KELVIN`] is *not* D65 (D65 sits slightly
+/// below it, Duv ≈ +0.003), so the white balance must adapt to D65, not to the
+/// locus point, or a neutral input would come out with a tiny tint.
+const D65_XY: [f32; 2] = [0.3127, 0.3290];
 /// Temp slider scale bounds.
 const KELVIN_COOL: f32 = 2000.0; // slider = -100
 const KELVIN_WARM: f32 = 15000.0; // slider = +100
@@ -124,6 +130,83 @@ pub(crate) fn slider_to_kelvin(slider: f32) -> f32 {
     1.0e6 / m
 }
 
+/// Inverse of [`slider_to_kelvin`] (linear in mired on each side), clamped to
+/// the slider range.
+fn kelvin_to_slider(kelvin: f32) -> f32 {
+    let m = 1.0e6 / kelvin.clamp(1.0, 1.0e9);
+    let m_ref = 1.0e6 / REFERENCE_KELVIN;
+    let m_warm = 1.0e6 / KELVIN_WARM;
+    let m_cool = 1.0e6 / KELVIN_COOL;
+    let slider = if m <= m_ref {
+        (m - m_ref) / (m_warm - m_ref) * 100.0
+    } else {
+        -(m - m_ref) / (m_cool - m_ref) * 100.0
+    };
+    slider.clamp(-100.0, 100.0)
+}
+
+/// White-balance picker: the `(temp, tint)` sliders that render the given
+/// linear-RGB sample neutral.
+///
+/// Inverts the forward model of [`WhiteBalance`]: the sample's chromaticity is
+/// taken as the white point, the closest point on the Planckian locus gives the
+/// CCT (temp) and the signed perpendicular distance gives Duv (tint).
+/// `None` when the sample is not a usable neutral reference (black, or a
+/// non-positive channel), so the caller leaves the white balance unchanged.
+pub(crate) fn sliders_from_linear(rgb: [f32; 3]) -> Option<(f32, f32)> {
+    if !rgb.iter().all(|c| *c > 1e-6) {
+        return None;
+    }
+    let xyz = mat3_apply(&RGB_TO_XYZ, rgb);
+    let sum = xyz[0] + xyz[1] + xyz[2];
+    if sum <= 1e-9 {
+        return None;
+    }
+    let target_uv = xy_to_uv([xyz[0] / sum, xyz[1] / sum]);
+
+    // Coarse scan over the slider's Kelvin range, then golden-section refine.
+    let dist2 = |k: f32| {
+        let uv = xy_to_uv(cct_to_xy(k));
+        (uv[0] - target_uv[0]).powi(2) + (uv[1] - target_uv[1]).powi(2)
+    };
+    let mut best_k = REFERENCE_KELVIN;
+    let mut best_d2 = f32::INFINITY;
+    let mut k = KELVIN_COOL;
+    while k <= KELVIN_WARM {
+        let d2 = dist2(k);
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best_k = k;
+        }
+        k += 50.0;
+    }
+    let (mut lo, mut hi) = (
+        (best_k - 50.0).max(KELVIN_COOL),
+        (best_k + 50.0).min(KELVIN_WARM),
+    );
+    for _ in 0..48 {
+        let m1 = lo + (hi - lo) * 0.382;
+        let m2 = hi - (hi - lo) * 0.382;
+        if dist2(m1) < dist2(m2) {
+            hi = m2;
+        } else {
+            lo = m1;
+        }
+    }
+    let kelvin = 0.5 * (lo + hi);
+
+    // Signed perpendicular distance from the locus (same tangent as `offset_duv`).
+    let uv = xy_to_uv(cct_to_xy(kelvin));
+    let uv_next = xy_to_uv(cct_to_xy(kelvin * 1.001));
+    let t = [uv_next[0] - uv[0], uv_next[1] - uv[1]];
+    let len = (t[0] * t[0] + t[1] * t[1]).sqrt().max(1e-9);
+    let perp = [-t[1] / len, t[0] / len];
+    let duv = (target_uv[0] - uv[0]) * perp[0] + (target_uv[1] - uv[1]) * perp[1];
+    // Undo the forward `duv = d65_duv() - tint/100 · TINT_DUV_SCALE`.
+    let tint = ((d65_duv() - duv) / TINT_DUV_SCALE * 100.0).clamp(-100.0, 100.0);
+    Some((kelvin_to_slider(kelvin), tint))
+}
+
 #[inline]
 fn xy_to_xyz(xy: [f32; 2]) -> [f32; 3] {
     let [x, y] = xy;
@@ -159,6 +242,24 @@ fn offset_duv(kelvin: f32, duv: f32) -> [f32; 2] {
     uv_to_xy([uv[0] + px * duv, uv[1] + py * duv])
 }
 
+/// Signed perpendicular distance of `xy` from the Planckian locus at `kelvin`,
+/// using the same tangent as [`offset_duv`].
+fn perpendicular_duv(kelvin: f32, xy: [f32; 2]) -> f32 {
+    let uv = xy_to_uv(cct_to_xy(kelvin));
+    let uv_next = xy_to_uv(cct_to_xy(kelvin * 1.001));
+    let t = [uv_next[0] - uv[0], uv_next[1] - uv[1]];
+    let len = (t[0] * t[0] + t[1] * t[1]).sqrt().max(1e-9);
+    let perp = [-t[1] / len, t[0] / len];
+    let p = xy_to_uv(xy);
+    (p[0] - uv[0]) * perp[0] + (p[1] - uv[1]) * perp[1]
+}
+
+/// Baseline Duv of D65 relative to the locus at [`REFERENCE_KELVIN`]. The white
+/// balance target at slider `(0, 0)` is D65, so this is added before the Tint.
+fn d65_duv() -> f32 {
+    perpendicular_duv(REFERENCE_KELVIN, D65_XY)
+}
+
 /// Bradford chromatic-adaptation matrix from `src_xy` to `dst_xy` (in linear RGB).
 fn bradford_rgb_matrix(src_xy: [f32; 2], dst_xy: [f32; 2]) -> Mat3 {
     let src_lms = mat3_apply(&BRADFORD, xy_to_xyz(src_xy));
@@ -186,10 +287,11 @@ impl WhiteBalance {
             };
         }
         let kelvin = slider_to_kelvin(temp_slider);
-        // Tint > 0 is magenta (below the locus), hence a negative Duv.
-        let duv = -(tint_slider / 100.0).clamp(-1.0, 1.0) * TINT_DUV_SCALE;
+        // Tint > 0 is magenta (below the locus), hence a negative Duv; the D65
+        // baseline keeps slider (0, 0) at the true output neutral.
+        let duv = d65_duv() - (tint_slider / 100.0).clamp(-1.0, 1.0) * TINT_DUV_SCALE;
         let target_xy = offset_duv(kelvin, duv);
-        let reference_xy = cct_to_xy(REFERENCE_KELVIN);
+        let reference_xy = D65_XY;
         Self {
             m: bradford_rgb_matrix(target_xy, reference_xy),
         }
@@ -444,6 +546,23 @@ pub(crate) struct ColorSettings {
     pub vibrance: f32,
 }
 
+/// Global hue rotation: rotates the Oklab chroma vector `(a, b)` by `radians`.
+///
+/// `L` and the chroma magnitude are preserved (only the hue angle changes), so
+/// neutrals (`a = b = 0`) stay neutral and nothing drifts in brightness. A
+/// positive angle rotates toward increasing Oklab hue (the same direction the
+/// mixer's hue angle grows).
+#[inline]
+pub(crate) fn apply_hue_rotation(p: &mut [f32; 3], radians: f32) {
+    if radians.abs() < 1e-6 {
+        return;
+    }
+    let (s, c) = radians.sin_cos();
+    let (a, b) = (p[1], p[2]);
+    p[1] = a * c - b * s;
+    p[2] = a * s + b * c;
+}
+
 /// Saturation + Vibrance over an Oklab pixel (order is fixed).
 #[inline]
 pub(crate) fn apply_chroma(p: &mut [f32; 3], s: &ColorSettings) {
@@ -465,6 +584,46 @@ mod tests {
         for c in 0..3 {
             assert!((rgb[c] - orig[c]).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn white_balance_picker_round_trips_the_target() {
+        // For every (temp, tint) the forward model adapts the target white point
+        // to D65 and renders it neutral. The picker must recover a white balance
+        // that keeps that same sample neutral.
+        for &(temp, tint) in &[
+            (-60.0f32, 0.0f32),
+            (-40.0, 30.0),
+            (0.0, 0.0),
+            (40.0, -30.0),
+            (60.0, 0.0),
+        ] {
+            let kelvin = slider_to_kelvin(temp);
+            let duv = d65_duv() - (tint / 100.0) * TINT_DUV_SCALE;
+            let rgb = mat3_apply(&XYZ_TO_RGB, xy_to_xyz(offset_duv(kelvin, duv)));
+            assert!(rgb.iter().all(|c| *c > 0.0), "sample {temp},{tint}: {rgb:?}");
+
+            let (temp2, tint2) = sliders_from_linear(rgb).expect("valid sample");
+            let mut corrected = rgb;
+            WhiteBalance::new(temp2, tint2).apply_linear(&mut corrected);
+            assert!(
+                (corrected[0] - corrected[1]).abs() < 2e-3
+                    && (corrected[1] - corrected[2]).abs() < 2e-3,
+                "wb {temp},{tint} -> {temp2},{tint2}: {corrected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn white_balance_picker_neutral_sample_is_noop() {
+        let (temp, tint) = sliders_from_linear([0.5, 0.5, 0.5]).unwrap();
+        assert!(temp.abs() < 2.0 && tint.abs() < 2.0, "{temp},{tint}");
+    }
+
+    #[test]
+    fn white_balance_picker_rejects_invalid_samples() {
+        assert!(sliders_from_linear([0.0, 0.5, 0.5]).is_none());
+        assert!(sliders_from_linear([-0.1, 0.5, 0.5]).is_none());
     }
 
     #[test]
@@ -567,6 +726,30 @@ mod tests {
             "sat {sat_gain} vs muted {muted_gain}"
         );
         assert!(sat_gain < 0.2, "saturated should grey out: {sat_gain}");
+    }
+
+    #[test]
+    fn hue_rotation_preserves_l_and_chroma() {
+        let mut p = [0.6f32, 0.12, -0.05];
+        let (l0, c0) = (p[0], (p[1] * p[1] + p[2] * p[2]).sqrt());
+        apply_hue_rotation(&mut p, 0.7);
+        let c1 = (p[1] * p[1] + p[2] * p[2]).sqrt();
+        assert!((p[0] - l0).abs() < 1e-6, "L drifted: {}", p[0]);
+        assert!((c1 - c0).abs() < 1e-4, "chroma drifted: {c1} vs {c0}");
+    }
+
+    #[test]
+    fn hue_rotation_by_90_degrees() {
+        let mut p = [0.6f32, 1.0, 0.0];
+        apply_hue_rotation(&mut p, std::f32::consts::FRAC_PI_2);
+        assert!(p[1].abs() < 1e-5 && (p[2] - 1.0).abs() < 1e-5, "{p:?}");
+    }
+
+    #[test]
+    fn hue_rotation_leaves_neutral_untouched() {
+        let mut p = [0.5f32, 0.0, 0.0];
+        apply_hue_rotation(&mut p, 2.0);
+        assert!(p[1].abs() < 1e-6 && p[2].abs() < 1e-6, "{p:?}");
     }
 
     #[test]

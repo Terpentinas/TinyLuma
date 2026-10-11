@@ -327,6 +327,7 @@ impl TinyLumaApp {
         }
         // Crop and retouch both own the canvas: leaving retouch is implicit.
         self.crop.active = false;
+        self.wb_picker_active = false;
         self.retouch.active = !self.retouch.active;
         // A session runs from activation (or the last undo/redo while active)
         // to deactivation; `Esc` reverts to `session_base`.

@@ -321,6 +321,20 @@ impl TinyLumaApp {
                             self.retouch_toggle();
                         }
 
+                        // White Balance picker — toggles the eyedropper.
+                        if tool_icon_button(
+                            ui,
+                            ph::EYEDROPPER,
+                            TOOL_BTN,
+                            self.wb_picker_active,
+                            true,
+                        )
+                        .on_hover_text("White Balance picker — click a neutral area (W)")
+                        .clicked()
+                        {
+                            self.wb_picker_toggle();
+                        }
+
                         // Before / After split.
                         let can_compare = self.original_texture.is_some();
                         let split_active = self.split_position > 0.0;

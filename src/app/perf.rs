@@ -57,10 +57,15 @@ enum Slider {
     GrainSize,
     LutIntensity,
     MixerSat,
+    GradingSat,
+    Brightness,
+    Hue,
+    VignetteAmount,
+    GrainRoughness,
 }
 
 impl Slider {
-    const ALL: [Slider; 18] = [
+    const ALL: [Slider; 23] = [
         Slider::Exposure,
         Slider::Contrast,
         Slider::Whites,
@@ -79,6 +84,11 @@ impl Slider {
         Slider::GrainSize,
         Slider::LutIntensity,
         Slider::MixerSat,
+        Slider::GradingSat,
+        Slider::Brightness,
+        Slider::Hue,
+        Slider::VignetteAmount,
+        Slider::GrainRoughness,
     ];
 
     fn name(self) -> &'static str {
@@ -101,6 +111,11 @@ impl Slider {
             Slider::GrainSize => "GrainSize",
             Slider::LutIntensity => "LutIntensity",
             Slider::MixerSat => "MixerSat",
+            Slider::GradingSat => "GradingSat",
+            Slider::Brightness => "Brightness",
+            Slider::Hue => "Hue",
+            Slider::VignetteAmount => "VignetteAmount",
+            Slider::GrainRoughness => "GrainRoughness",
         }
     }
 
@@ -120,6 +135,9 @@ impl Slider {
                 | Slider::Saturation
                 | Slider::LutIntensity
                 | Slider::MixerSat
+                | Slider::GradingSat
+                | Slider::Brightness
+                | Slider::Hue
         )
     }
 
@@ -144,6 +162,14 @@ impl Slider {
             Slider::GrainSize => s.grain_size += NUDGE,
             Slider::LutIntensity => s.lut_intensity += NUDGE,
             Slider::MixerSat => s.hsl.bands[0][1] += NUDGE,
+            Slider::GradingSat => {
+                s.grading.shadows.sat += NUDGE;
+                s.grading.shadows.hue = 30.0;
+            }
+            Slider::Brightness => s.brightness += NUDGE,
+            Slider::Hue => s.hue += NUDGE,
+            Slider::VignetteAmount => s.vignette.amount += NUDGE,
+            Slider::GrainRoughness => s.grain_roughness += NUDGE,
         }
     }
 }
@@ -172,6 +198,21 @@ fn baseline_settings() -> FilterSettings {
         lut_intensity: 85.0,
         grain: 30.0,
         grain_size: 60.0,
+        grain_roughness: 40.0,
+        brightness: 20.0,
+        hue: 40.0,
+        vignette: crate::pipeline::vignette::VignetteSettings {
+            amount: -40.0,
+            ..Default::default()
+        },
+        grading: crate::pipeline::grading::ColorGrading {
+            shadows: crate::pipeline::grading::GradingWheel {
+                hue: 210.0,
+                sat: 40.0,
+                lum: 0.0,
+            },
+            ..Default::default()
+        },
         ..FilterSettings::default()
     }
 }
@@ -271,6 +312,8 @@ struct Harness {
     grain: Vec<f32>,
     /// Grain-size slider value `grain` was generated for.
     grain_size: f32,
+    /// Whether `grain` carries a rough channel (Grain Roughness engaged).
+    grain_rough: bool,
     lut: Lut3D,
     combined: Lut3D,
     settings: FilterSettings,
@@ -281,7 +324,13 @@ impl Harness {
     fn new(w: usize, h: usize, baseline: FilterSettings, lut: Lut3D) -> Self {
         let base = synth_image(w, h);
         let n = base.len();
-        let grain = TinyLumaApp::generate_grain_map(w, h, 42, baseline.grain_size);
+        let grain = TinyLumaApp::generate_grain_map(
+            w,
+            h,
+            42,
+            baseline.grain_size,
+            baseline.grain_roughness > 0.0,
+        );
         Self {
             w,
             h,
@@ -296,6 +345,7 @@ impl Harness {
             spatial_base: SpatialBase::default(),
             grain,
             grain_size: baseline.grain_size,
+            grain_rough: baseline.grain_roughness > 0.0,
             lut,
             combined: Lut3D {
                 size: 2,
@@ -381,11 +431,21 @@ impl Harness {
 
     /// Spatial pass on top of the prepared caches.
     fn run_spatial(&mut self) {
-        // Mirror the app: regenerate the grain map when the Size slider moved.
-        if self.settings.grain != 0.0 && self.grain_size != self.settings.grain_size {
-            self.grain =
-                TinyLumaApp::generate_grain_map(self.w, self.h, 42, self.settings.grain_size);
+        // Mirror the app: regenerate the grain map when the Size slider moved or
+        // the Roughness (on/off) changed.
+        let want_rough = self.settings.grain_roughness > 0.0;
+        if self.settings.grain != 0.0
+            && (self.grain_size != self.settings.grain_size || self.grain_rough != want_rough)
+        {
+            self.grain = TinyLumaApp::generate_grain_map(
+                self.w,
+                self.h,
+                42,
+                self.settings.grain_size,
+                want_rough,
+            );
             self.grain_size = self.settings.grain_size;
+            self.grain_rough = want_rough;
         }
         let use_dehaze = self.settings.dehaze != 0.0;
         let input: &[u8] = if use_dehaze {
@@ -396,7 +456,9 @@ impl Harness {
         let needs_spatial = self.settings.texture != 0.0
             || self.settings.clarity != 0.0
             || self.settings.sharpen > 0.0
-            || self.settings.grain != 0.0;
+            || self.settings.grain != 0.0
+            || !self.settings.noise.is_identity()
+            || !self.settings.vignette.is_identity();
         if needs_spatial {
             TinyLumaApp::run_spatial_pass_with_base(
                 &self.settings,

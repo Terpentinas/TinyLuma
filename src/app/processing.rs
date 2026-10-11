@@ -12,13 +12,17 @@ use crate::color::oklab::{
     linear_to_srgb, oklab_to_linear_rgb, rgb_to_oklab, srgb_to_linear, srgb_u8_linear_table,
 };
 use crate::lut::Lut3D;
-use crate::pipeline::color::{ColorSettings, WhiteBalance, apply_chroma, gamut_map_linear};
+use crate::pipeline::color::{
+    ColorSettings, WhiteBalance, apply_chroma, apply_hue_rotation, gamut_map_linear,
+};
 use crate::pipeline::curve::CurveTables;
+use crate::pipeline::grading::{GradingParams, apply_grading};
 use crate::pipeline::hsl::apply_hsl;
 use crate::pipeline::light::{
     LightSettings, apply_light, contrast_from_slider, exposure_from_slider, unit_from_slider,
 };
 use crate::pipeline::noise;
+use crate::pipeline::vignette::VignetteParams;
 use crate::retouch::RetouchLayer;
 use crate::settings::FilterSettings;
 
@@ -79,7 +83,8 @@ impl TinyLumaApp {
     /// Pass 1: color. All edits are per-pixel and baked into the combined LUT.
     ///
     /// Order: sRGB→linear → white balance (Bradford) → Oklab → Light →
-    /// Saturation/Vibrance → soft gamut → linear→sRGB → external LUT.
+    /// HSL mixer → Hue → Saturation/Vibrance → Color Grading → soft gamut →
+    /// linear→sRGB → external LUT.
     pub(crate) fn run_color_pass(
         settings: &FilterSettings,
         active_lut: Option<&Lut3D>,
@@ -97,6 +102,7 @@ impl TinyLumaApp {
             shadows: unit_from_slider(settings.shadows),
             whites: unit_from_slider(settings.whites),
             blacks: unit_from_slider(settings.blacks),
+            brightness: unit_from_slider(settings.brightness),
         };
 
         let color = ColorSettings {
@@ -109,6 +115,15 @@ impl TinyLumaApp {
         let hsl_identity = settings.hsl.is_identity();
         let hsl = settings.hsl;
         let chroma_identity = color.saturation.abs() < 1e-6 && color.vibrance.abs() < 1e-6;
+        // Global hue rotation (radians). Applied after the mixer, before chroma,
+        // matching RapidRAW's pipeline order.
+        let hue = settings.hue.to_radians();
+        let hue_identity = hue.abs() < 1e-6;
+
+        // Color grading is per-pixel too (constant Oklab offsets), so it bakes
+        // into the same LUT. Precompute the wheel offsets once.
+        let grading = GradingParams::new(&settings.grading);
+        let grading_identity = grading.is_identity();
 
         let lut_intensity = settings.lut_intensity / 100.0;
 
@@ -138,8 +153,19 @@ impl TinyLumaApp {
             if !hsl_identity {
                 apply_hsl(&mut p, &hsl);
             }
+            // Global hue rotation sits between the mixer and chroma, so the
+            // mixer works on the original hues and saturation reacts to the
+            // rotated result.
+            if !hue_identity {
+                apply_hue_rotation(&mut p, hue);
+            }
             if !chroma_identity {
                 apply_chroma(&mut p, &color);
+            }
+            // Color grading tints by tonal zone after the mixer/chroma so it
+            // reacts to the final lightness.
+            if !grading_identity {
+                apply_grading(&mut p, &grading);
             }
 
             let out = gamut_map_linear(p[0], p[1], p[2]);
@@ -219,7 +245,7 @@ impl TinyLumaApp {
 
     // ==========================================
     // PASS 2: SPATIAL EFFECTS
-    // (Texture, Clarity, Sharpen, Dehaze)
+    // (Noise, Texture, Clarity, Sharpen, Grain, Vignette)
     // ==========================================
     /// Precomputations for the spatial pass (the bilateral Texture base and the luma
     /// blur for Sharpen). Depend ONLY on the input and resolution, but NOT on the
@@ -333,6 +359,10 @@ impl TinyLumaApp {
         // Per-pixel noise-reduction plan (chroma mix / luma mix + soft thresholds).
         let nr_plan = noise::plan(&s.noise);
         let noise_active = !s.noise.is_identity();
+
+        // Vignette: positional falloff, applied last (after grain).
+        let vignette = VignetteParams::new(&s.vignette);
+        let vignette_active = !vignette.is_identity();
 
         // Read from color_buffer (stable color_pass result) — WITHOUT clone!
         let color_snapshot: &[u8] = color_buffer;
@@ -504,8 +534,18 @@ impl TinyLumaApp {
                 // 🎞 FILM GRAIN (darktable grain.c: simplex + paper LUT)
                 // ==========================================
                 if s.grain > 0.0 {
-                    if let Some(&noise) = grain_map.get(idx) {
+                    // Interleaved map: slot 0 = base, slot 1 = coarser rough
+                    // field (present only when roughness was engaged).
+                    if let Some(&base) = grain_map.get(idx * 2) {
                         let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                        let noise = match grain_map.get(idx * 2 + 1) {
+                            Some(&rough) => crate::pipeline::grain::blend_noise(
+                                base,
+                                rough,
+                                s.grain_roughness / 100.0,
+                            ),
+                            None => base,
+                        };
                         let delta =
                             crate::pipeline::grain::grain_delta(noise, s.grain / 100.0, luma);
                         // Monochrome lightness grain: the same shift in all channels.
@@ -513,6 +553,17 @@ impl TinyLumaApp {
                         g = (g + delta).clamp(0.0, 1.0);
                         b = (b + delta).clamp(0.0, 1.0);
                     }
+                }
+
+                // ==========================================
+                // 🌑 VIGNETTE (positional, after grain)
+                // ==========================================
+                if vignette_active {
+                    let mut rgb = [r, g, b];
+                    vignette.apply(&mut rgb, x, y, width, height);
+                    r = rgb[0];
+                    g = rgb[1];
+                    b = rgb[2];
                 }
 
                 pixel[0] = (r * 255.0).clamp(0.0, 255.0) as u8;
@@ -1065,7 +1116,8 @@ impl TinyLumaApp {
             || settings.clarity != 0.0
             || settings.sharpen > 0.0
             || settings.grain != 0.0
-            || !settings.noise.is_identity();
+            || !settings.noise.is_identity()
+            || !settings.vignette.is_identity();
 
         if !needs_spatial {
             return color_buffer;
@@ -1078,7 +1130,13 @@ impl TinyLumaApp {
         } else {
             (Vec::new(), 0, 0)
         };
-        let grain_map = Self::generate_grain_map(w, h, 42, settings.grain_size);
+        let grain_map = Self::generate_grain_map(
+            w,
+            h,
+            42,
+            settings.grain_size,
+            settings.grain_roughness > 0.0,
+        );
 
         let mut output = vec![0u8; color_buffer.len()];
         Self::run_spatial_pass(
@@ -1156,7 +1214,8 @@ impl TinyLumaApp {
             || self.settings.clarity != 0.0
             || self.settings.sharpen > 0.0
             || self.settings.grain > 0.0
-            || !self.settings.noise.is_identity();
+            || !self.settings.noise.is_identity()
+            || !self.settings.vignette.is_identity();
 
         // During a COLOR slider drag the spatial pass is not recomputed:
         // this saves ~22 ms/frame, the full render happens on release.
@@ -1616,7 +1675,7 @@ mod tests {
         let color: Vec<u8> = (0..w * h * 3).map(|i| ((i * 7 + i / 11) % 256) as u8).collect();
         let luma = TinyLumaApp::compute_luma_map(&color);
         let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
-        let grain = vec![0.0f32; w * h];
+        let grain = vec![0.0f32; w * h * 2];
 
         let mut s = FilterSettings::default();
         s.texture = 40.0;
@@ -1646,7 +1705,7 @@ mod tests {
         let color: Vec<u8> = (0..w * h * 3).map(|i| ((i * 13 + 5) % 256) as u8).collect();
         let luma = TinyLumaApp::compute_luma_map(&color);
         let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
-        let grain = vec![0.0f32; w * h];
+        let grain = vec![0.0f32; w * h * 2];
 
         // The base is captured at one set of strengths and then reused at others.
         let mut base_settings = FilterSettings::default();
@@ -1682,7 +1741,7 @@ mod tests {
         let color: Vec<u8> = (0..w * h * 3).map(|i| ((i * 11 + 3) % 256) as u8).collect();
         let luma = TinyLumaApp::compute_luma_map(&color);
         let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
-        let grain = vec![0.0f32; w * h];
+        let grain = vec![0.0f32; w * h * 2];
         let s = FilterSettings::default();
         let mut out = vec![0u8; color.len()];
         TinyLumaApp::run_spatial_pass(&s, &color, &mut out, &grain, &luma, &clarity, sw, sh, w, h);
@@ -1705,7 +1764,7 @@ mod tests {
         }
         let luma = TinyLumaApp::compute_luma_map(&color);
         let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
-        let grain = vec![0.0f32; w * h];
+        let grain = vec![0.0f32; w * h * 2];
 
         let mut s = FilterSettings::default();
         s.noise.chroma = 100.0;
@@ -1749,7 +1808,7 @@ mod tests {
         }
         let luma = TinyLumaApp::compute_luma_map(&color);
         let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
-        let grain = vec![0.0f32; w * h];
+        let grain = vec![0.0f32; w * h * 2];
 
         let mut s = FilterSettings::default();
         s.noise.luma = 100.0;
@@ -1798,7 +1857,7 @@ mod tests {
         }
         let luma = TinyLumaApp::compute_luma_map(&color);
         let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
-        let grain = vec![0.0f32; w * h];
+        let grain = vec![0.0f32; w * h * 2];
 
         let run = |masking: f32| -> Vec<u8> {
             let mut s = FilterSettings::default();
@@ -1842,7 +1901,7 @@ mod tests {
         }
         let luma = TinyLumaApp::compute_luma_map(&color);
         let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
-        let grain = vec![0.0f32; w * h];
+        let grain = vec![0.0f32; w * h * 2];
 
         let mut s = FilterSettings::default();
         s.sharpen = 100.0;
@@ -1876,7 +1935,7 @@ mod tests {
         }
         let luma = TinyLumaApp::compute_luma_map(&color);
         let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
-        let grain = vec![0.0f32; w * h];
+        let grain = vec![0.0f32; w * h * 2];
 
         let run = |masking: f32| -> Vec<u8> {
             let mut s = FilterSettings::default();
@@ -1916,7 +1975,7 @@ mod tests {
             let color: Vec<u8> = (0..n * 3).map(|i| ((i * 7 + i / 13) % 256) as u8).collect();
             let luma = TinyLumaApp::compute_luma_map(&color);
             let (clarity, csw, csh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
-            let grain = vec![0.0f32; n];
+            let grain = vec![0.0f32; n * 2];
             let mut out = vec![0u8; n * 3];
             let mut s = FilterSettings::default();
             s.texture = 50.0;

@@ -800,6 +800,10 @@ impl TinyLumaApp {
         // --- RETOUCH: takes over the left button while the tool is active ---
         let retouch_consumed = self.retouch_pointer(ui, hit_rect, hover_pos);
 
+        // --- WHITE-BALANCE PICKER: a left click samples a neutral point ---
+        let wb_consumed =
+            self.wb_picker_pointer(ui, hit_rect, hover_pos, visible, orientation, angle);
+
         // --- PANNING: left-drag anywhere (the splitter keeps priority) ---
         let space_held = ui.input(|i| i.key_down(egui::Key::Space));
         // Classify the gesture once, at the start of the drag.
@@ -841,6 +845,7 @@ impl TinyLumaApp {
             && !self.show_save_dialog
             && !over_splitter
             && !retouch_consumed
+            && !wb_consumed
             && response.clicked()
         {
             let at_fit = (self.zoom_scale - 1.0).abs() < 0.001
@@ -1083,6 +1088,8 @@ impl TinyLumaApp {
             Some(ph::HAND_GRABBING)
         } else if space_held && pointer_over {
             Some(ph::HAND)
+        } else if self.wb_picker_active && over_image {
+            Some(ph::EYEDROPPER)
         } else if over_image && !over_splitter {
             Some(if self.zoom_scale <= 1.0 {
                 ph::MAGNIFYING_GLASS_PLUS

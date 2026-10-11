@@ -26,6 +26,8 @@ pub(crate) mod crop;
 pub(crate) mod retouch;
 pub(crate) mod persist;
 #[cfg(test)]
+mod calibration;
+#[cfg(test)]
 mod perf;
 
 /// Main application state.
@@ -74,6 +76,9 @@ pub(crate) struct TinyLumaApp {
     pub(crate) retouch: retouch::RetouchState,
     /// Crop state: value + tool. See `app/crop.rs`.
     pub(crate) crop: crop::CropState,
+    /// White-balance picker (eyedropper) is active. Tool state, never serialized;
+    /// mutually exclusive with crop/retouch. See `ui/wb_picker.rs`.
+    pub(crate) wb_picker_active: bool,
     /// A retouch change requires re-running the heal + the pipeline.
     pub(crate) retouch_dirty: bool,
     /// Screen rect of the retouch options bar (set while drawing it), so canvas
@@ -107,6 +112,10 @@ pub(crate) struct TinyLumaApp {
     /// Open/closed state of the COLOR MIXER group (its own field, so extending
     /// the four-entry `open_groups` array cannot break old configs).
     pub(crate) open_mixer_group: bool,
+    /// Open/closed state of the COLOR GRADING group (its own field, same reason).
+    pub(crate) open_grading_group: bool,
+    /// The colour-grading wheel being edited (0=Shadows … 3=Global). UI-only.
+    pub(crate) grading_region: usize,
     /// The colour-mixer band being edited (0..8). UI-only, never serialized.
     pub(crate) mixer_band: usize,
     /// Tone-curve editor state: the channel being edited and, while dragging,
@@ -131,6 +140,9 @@ pub(crate) struct TinyLumaApp {
     pub(crate) grain_map_dims: (usize, usize),
     /// Grain-size slider value `grain_map` was generated for (for reuse).
     pub(crate) grain_map_size: f32,
+    /// Whether `grain_map` carries a generated rough channel (interleaved),
+    /// i.e. it was built with Grain Roughness engaged.
+    pub(crate) grain_map_has_rough: bool,
     /// LRU cache of decoded previews — instant frame switching.
     pub(crate) preview_cache: image_io::PreviewCache,
     pub(crate) drag_active: bool,
@@ -612,6 +624,7 @@ impl TinyLumaApp {
             },
             retouch_dirty: false,
             crop: crop::CropState::default(),
+            wb_picker_active: false,
             retouch_options_rect: None,
             crop_options_rect: None,
             tools_rect: None,
@@ -634,6 +647,7 @@ impl TinyLumaApp {
             grain_map: Vec::new(),
             grain_map_dims: (0, 0),
             grain_map_size: crate::settings::default_grain_size(),
+            grain_map_has_rough: false,
             // The preview cache budget is set in bytes (base + render), so
             // memory does not grow linearly with the number of open frames. At 1200px
             // 256 MiB is ~30–40 previews around the current one.
@@ -675,6 +689,8 @@ impl TinyLumaApp {
             open_groups: saved.open_groups,
             open_curve_group: saved.open_curve_group,
             open_mixer_group: saved.open_mixer_group,
+            open_grading_group: saved.open_grading_group,
+            grading_region: 0,
             mixer_band: 0,
             curve_channel: CurveChannel::Master,
             curve_drag: None,

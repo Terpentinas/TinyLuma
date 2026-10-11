@@ -6,8 +6,10 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::pipeline::curve::ToneCurves;
+use crate::pipeline::grading::ColorGrading;
 use crate::pipeline::hsl::HslSettings;
 use crate::pipeline::noise::NoiseSettings;
+use crate::pipeline::vignette::VignetteSettings;
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Debug)]
 pub(crate) enum SaveFormat {
@@ -61,6 +63,9 @@ pub(crate) struct SaveSettings {
     /// Open/closed state of the COLOR MIXER group (own field, same reason).
     #[serde(default = "default_true")]
     pub(crate) open_mixer_group: bool,
+    /// Open/closed state of the COLOR GRADING group (own field, same reason).
+    #[serde(default = "default_true")]
+    pub(crate) open_grading_group: bool,
     /// Source folder of the most recent session that had edits. Powers the
     /// hero-screen "Continue last session" button. `None` when the last
     /// session had no edits (or its edits were reverted). `serde(default)`
@@ -86,6 +91,7 @@ impl Default for SaveSettings {
             brush_hardness: default_brush_hardness(),
             open_curve_group: default_true(),
             open_mixer_group: default_true(),
+            open_grading_group: default_true(),
             last_session_folder: None,
         }
     }
@@ -147,10 +153,18 @@ pub(crate) struct FilterSettings {
     pub(crate) blacks: f32,
     pub(crate) shadows: f32,
     pub(crate) highlights: f32,
+    /// Midtone lift, `-100..=100`, independent of Exposure. `serde(default)`
+    /// keeps older presets/configs loading as a no-op.
+    #[serde(default)]
+    pub(crate) brightness: f32,
     pub(crate) temp: f32,
     pub(crate) tint: f32, // Added tint
     pub(crate) vibrance: f32,
     pub(crate) saturation: f32,
+    /// Global hue rotation in degrees, `-180..=180`. `serde(default)` keeps
+    /// older presets/configs loading as a no-op.
+    #[serde(default)]
+    pub(crate) hue: f32,
 
     pub(crate) texture: f32,
     pub(crate) clarity: f32,
@@ -171,6 +185,11 @@ pub(crate) struct FilterSettings {
     /// give coarser grain. `serde(default)` keeps older presets/configs loading.
     #[serde(default = "default_grain_size")]
     pub(crate) grain_size: f32,
+    /// Grain roughness, `0..100`: mixes in a coarser second noise field (as in
+    /// RapidRAW). `0` keeps the previous look; `serde(default)` keeps older
+    /// presets/configs loading.
+    #[serde(default)]
+    pub(crate) grain_roughness: f32,
 
     /// Master + per-channel tone curves. Applied in the color pass (baked into
     /// the combined LUT); `serde(default)` keeps older presets loading as a
@@ -189,6 +208,18 @@ pub(crate) struct FilterSettings {
     /// loading as a no-op.
     #[serde(default)]
     pub(crate) noise: NoiseSettings,
+
+    /// Color Grading / split toning (per-pixel, baked into the combined LUT):
+    /// four tonal wheels (Shadows, Midtones, Highlights, Global) plus Blending
+    /// and Balance. `serde(default)` keeps older presets loading as a no-op.
+    #[serde(default)]
+    pub(crate) grading: ColorGrading,
+
+    /// Vignette (spatial pass, after grain): corner darkening/lightening with
+    /// midpoint, roundness and feather. `serde(default)` keeps older presets
+    /// loading as a no-op.
+    #[serde(default)]
+    pub(crate) vignette: VignetteSettings,
 }
 
 impl Default for FilterSettings {
@@ -201,10 +232,12 @@ impl Default for FilterSettings {
             blacks: 0.0,
             shadows: 0.0,
             highlights: 0.0,
+            brightness: 0.0,
             temp: 0.0,
             tint: 0.0,
             vibrance: 0.0,
             saturation: 0.0,
+            hue: 0.0,
 
             texture: 0.0,
             clarity: 0.0,
@@ -214,9 +247,12 @@ impl Default for FilterSettings {
             lut_intensity: 0.0,
             grain: 0.0,
             grain_size: default_grain_size(),
+            grain_roughness: 0.0,
             curves: ToneCurves::default(),
             hsl: HslSettings::default(),
             noise: NoiseSettings::default(),
+            grading: ColorGrading::default(),
+            vignette: VignetteSettings::default(),
         }
     }
 }
