@@ -17,7 +17,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use crate::app::TinyLumaApp;
 use crate::pipeline::grading::{GradingWheel, hsv_to_rgb};
 use crate::theme;
-use crate::ui::widgets::labeled_slider;
+use crate::ui::widgets::{labeled_slider, labeled_slider_gradient};
 
 /// Region captions, in the order of [`ColorGrading::wheels`].
 const REGIONS: [&str; 4] = ["Shadows", "Midtones", "Highlights", "Global"];
@@ -87,14 +87,33 @@ impl TinyLumaApp {
             });
         });
 
-        // Luminance of the selected wheel.
+        // Luminance of the selected wheel. The rail is tinted with the wheel's
+        // current hue/saturation, so it recolours as the wheel is dragged.
+        let tint = match region {
+            0 => grading.shadows,
+            1 => grading.midtones,
+            2 => grading.highlights,
+            _ => grading.global,
+        };
+        let tint_sat = (tint.sat / 100.0).clamp(0.0, 1.0);
+        // RapidRAW `cg-lum-gradient`: black → tinted mid → white at the wheel's
+        // live hue/saturation, so it recolours as the wheel is dragged.
+        let lum_track: [egui::Color32; 3] =
+            [0.0, 0.5, 1.0].map(|l| theme::hsl_color(tint.hue, tint_sat, l));
         let lum = match region {
             0 => &mut grading.shadows.lum,
             1 => &mut grading.midtones.lum,
             2 => &mut grading.highlights.lum,
             _ => &mut grading.global.lum,
         };
-        let (c, d) = labeled_slider(ui, "Luminance", lum, -100.0..=100.0, 0.0);
+        let (c, d) = labeled_slider_gradient(
+            ui,
+            "Luminance",
+            lum,
+            -100.0..=100.0,
+            0.0,
+            &lum_track,
+        );
         changed |= c;
         dragging |= d;
 

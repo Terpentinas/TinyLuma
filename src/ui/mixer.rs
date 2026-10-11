@@ -9,9 +9,9 @@ use eframe::egui;
 use egui_phosphor::regular as ph;
 
 use crate::app::TinyLumaApp;
-use crate::pipeline::hsl::{BAND_NAMES, HSL_BANDS};
+use crate::pipeline::hsl::{BAND_NAMES, HSL_BANDS, band_center_hue};
 use crate::theme;
-use crate::ui::widgets::labeled_slider;
+use crate::ui::widgets::labeled_slider_gradient;
 
 impl TinyLumaApp {
     /// The COLOR MIXER group body: band chips + Hue/Saturation/Luminance.
@@ -73,15 +73,61 @@ impl TinyLumaApp {
             });
         });
 
-        // --- the three band sliders ---
+        // --- the three band sliders (coloured rails) ---
+        // The gradients follow `pipeline::hsl`'s own scales so the colour under
+        // the handle is the actual output hue: the Hue rail spans ±30° (our
+        // `HUE_SCALE` is 0.5 rad ≈ 28.65°), and Saturation/Luminance re-tint
+        // live as the Hue/Saturation sliders move. Palette (`hsl`, 50%) matches
+        // RapidRAW's mixer rails.
+        let band_hue = band_center_hue(band);
+        const HUE_SCALE_DEG: f32 = 28.65;
+
         let values = &mut self.settings.hsl.bands[band];
-        let (c, d) = labeled_slider(ui, "Hue", &mut values[0], -100.0..=100.0, 0.0);
+
+        let hue_track: [egui::Color32; 9] = std::array::from_fn(|i| {
+            let t = i as f32 / 8.0;
+            theme::hsl_color(band_hue - 30.0 + t * 60.0, 0.5, 0.5)
+        });
+        let (c, d) = labeled_slider_gradient(
+            ui,
+            "Hue",
+            &mut values[0],
+            -100.0..=100.0,
+            0.0,
+            &hue_track,
+        );
         changed |= c;
         dragging |= d;
-        let (c, d) = labeled_slider(ui, "Saturation", &mut values[1], -100.0..=100.0, 0.0);
+
+        let effective_hue = band_hue + values[0] * HUE_SCALE_DEG / 100.0;
+
+        // Saturation: neutral → vivid band colour (RapidRAW `sat-slider-*`).
+        let sat_track: [egui::Color32; 3] =
+            std::array::from_fn(|i| theme::hsl_color(effective_hue, i as f32 / 2.0, 0.5));
+        let (c, d) = labeled_slider_gradient(
+            ui,
+            "Saturation",
+            &mut values[1],
+            -100.0..=100.0,
+            0.0,
+            &sat_track,
+        );
         changed |= c;
         dragging |= d;
-        let (c, d) = labeled_slider(ui, "Luminance", &mut values[2], -100.0..=100.0, 0.0);
+
+        // Luminance: black → tinted mid → white at the live saturation
+        // (RapidRAW `lum-slider-*`).
+        let effective_sat = ((values[1] + 100.0) / 200.0).clamp(0.0, 1.0);
+        let lum_track: [egui::Color32; 3] =
+            [0.0, 0.5, 1.0].map(|l| theme::hsl_color(effective_hue, effective_sat, l));
+        let (c, d) = labeled_slider_gradient(
+            ui,
+            "Luminance",
+            &mut values[2],
+            -100.0..=100.0,
+            0.0,
+            &lum_track,
+        );
         changed |= c;
         dragging |= d;
 

@@ -339,12 +339,14 @@ impl TinyLumaApp {
                             if d {
                                 self.drag_active = true;
                             }
-                            let (c, d) = labeled_slider(
+                            let hue_track = theme::hue_rainbow();
+                            let (c, d) = labeled_slider_gradient(
                                 ui,
                                 "Hue",
                                 &mut self.settings.hue,
                                 -180.0..=180.0,
                                 def.hue,
+                                &hue_track,
                             );
                             if c {
                                 color_changed = true;
@@ -533,6 +535,19 @@ impl TinyLumaApp {
                             }
                             let (c, d) = labeled_slider(
                                 ui,
+                                "Structure",
+                                &mut self.settings.structure,
+                                -100.0..=100.0,
+                                def.structure,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+                            let (c, d) = labeled_slider(
+                                ui,
                                 "Sharpening",
                                 &mut self.settings.sharpen,
                                 0.0..=150.0,
@@ -683,6 +698,54 @@ impl TinyLumaApp {
                                 &mut self.settings.grain_roughness,
                                 0.0..=100.0,
                                 def.grain_roughness,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+
+                            // --- CREATIVE subsection (glow / halation / flares) ---
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!("{} CREATIVE", ph::SPARKLE))
+                                    .size(11.0)
+                                    .color(theme::TEXT_TERTIARY),
+                            );
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Glow",
+                                &mut self.settings.glow,
+                                0.0..=100.0,
+                                def.glow,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Halation",
+                                &mut self.settings.halation,
+                                0.0..=100.0,
+                                def.halation,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Light Flares",
+                                &mut self.settings.flare,
+                                0.0..=100.0,
+                                def.flare,
                             );
                             if c {
                                 spatial_changed = true;

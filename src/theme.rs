@@ -51,6 +51,9 @@ pub const NAV_BORDER: Color32 = Color32::from_rgba_premultiplied(145, 145, 145, 
 pub const SEPARATOR: Color32 = Color32::from_rgb(56, 56, 58);
 /// A more noticeable border (hover, selection frame). #48484A.
 pub const BORDER: Color32 = Color32::from_rgb(72, 72, 74);
+/// Slider rail. Brighter than `BG_SURFACE` (#2C2C2E) so the track reads
+/// clearly against the panel background.
+pub const SLIDER_RAIL: Color32 = Color32::from_rgb(74, 74, 78);
 /// The line under the window/dialog title and other structural dividers
 /// (under the toolbar, the filmstrip edges, the verticals in the toolbar).
 /// Translucent white, not grey: on any dark background it gives a neat
@@ -118,6 +121,35 @@ pub const TINT_TRACK: [Color32; 5] = [
     Color32::from_rgb(156, 84, 138),
     Color32::from_rgb(190, 64, 159),
 ];
+
+/// HSL → egui colour. `h` in degrees, `s`/`l` in `0..=1`. Small and
+/// dependency-free so the UI can build per-band / per-wheel rails on the fly.
+/// Matches RapidRAW's track palette, which is authored in HSL.
+pub(crate) fn hsl_color(h: f32, s: f32, l: f32) -> Color32 {
+    let h = h.rem_euclid(360.0) / 60.0;
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c * 0.5;
+    Color32::from_rgb(
+        ((r + m) * 255.0 + 0.5) as u8,
+        ((g + m) * 255.0 + 0.5) as u8,
+        ((b + m) * 255.0 + 0.5) as u8,
+    )
+}
+
+/// Full hue wheel for the global Hue-rotation slider: `hsl(0..360, 55%, 55%)`
+/// at 30° steps, matching RapidRAW's `hue-range-track`.
+pub(crate) fn hue_rainbow() -> [Color32; 13] {
+    std::array::from_fn(|i| hsl_color(i as f32 / 12.0 * 360.0, 0.55, 0.55))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Histogram

@@ -34,6 +34,12 @@ pub(crate) const BAND_NAMES: [&str; HSL_BANDS] = [
 /// Band centre hues as HSV hue angles (degrees), in Lightroom order.
 const MIXER_HUES: [f32; HSL_BANDS] = [0.0, 30.0, 60.0, 120.0, 180.0, 225.0, 270.0, 315.0];
 
+/// HSV hue angle (degrees) of band `i`'s centre — used by the UI to colour the
+/// mixer's Hue / Saturation / Luminance rails.
+pub(crate) fn band_center_hue(i: usize) -> f32 {
+    MIXER_HUES[i.min(HSL_BANDS - 1)]
+}
+
 /// Hue-shift scale: slider ±100 → ±0.5 rad (≈ ±28.6°).
 const HUE_SCALE: f32 = 0.5;
 /// Luminance-shift scale: slider ±100 → ±0.18 in Oklab `L`.

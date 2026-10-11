@@ -15,7 +15,9 @@ use crate::lut::Lut3D;
 use crate::pipeline::color::{
     ColorSettings, WhiteBalance, apply_chroma, apply_hue_rotation, gamut_map_linear,
 };
+use crate::pipeline::creative;
 use crate::pipeline::curve::CurveTables;
+use crate::pipeline::flare::{self, FlareBase};
 use crate::pipeline::grading::{GradingParams, apply_grading};
 use crate::pipeline::hsl::apply_hsl;
 use crate::pipeline::light::{
@@ -40,6 +42,15 @@ const CLARITY_SCALE: usize = 8;
 const MASK_RADIUS: f32 = 2.0;
 /// Energy knee (luma²) of the detail mask: below it an area counts as flat.
 const MASK_KNEE2: f32 = 0.002;
+
+/// Long side of the reduced-resolution plane shared by Glow and Structure.
+const CREATIVE_WORK_MAX: usize = 256;
+/// Radius of the wide Gaussian blur, as a fraction of the base's short side
+/// (RapidRAW blurs with radius 40 at a 1080px reference).
+const GLOW_RADIUS_FRAC: f32 = 0.037;
+/// Long side and radius fraction of the tighter Halation blur.
+const HALATION_WORK_MAX: usize = 512;
+const HALATION_RADIUS_FRAC: f32 = 0.0074;
 
 /// RGB texture base at working resolution (interleaved storage).
 pub(crate) struct TextureBase {
@@ -77,6 +88,13 @@ pub(crate) struct SpatialBase {
     /// Shared detail mask for Texture/Clarity/Sharpen (present only when
     /// `detail_masking > 0`).
     pub(crate) mask_base: Option<MaskBase>,
+    /// Wide RGB low-pass shared by Glow and Structure (present only when either
+    /// is engaged). Stored as a reduced-resolution [`TextureBase`].
+    pub(crate) wide_blur: Option<TextureBase>,
+    /// Tighter RGB low-pass for Halation (present only when `halation > 0`).
+    pub(crate) halation_blur: Option<TextureBase>,
+    /// Precomputed light-flare map (present only when `flare > 0`).
+    pub(crate) flare_base: Option<FlareBase>,
 }
 
 impl TinyLumaApp {
@@ -298,11 +316,42 @@ impl TinyLumaApp {
         let mask_base = (settings.detail_masking > 0.0)
             .then(|| Self::compute_mask_base(luma_map, width, height, detail_scale));
 
+        // Wide low-pass shared by Glow and Structure. Its radius scales with the
+        // base's short side, so preview and export match.
+        let wide_blur = (settings.glow > 0.0 || settings.structure != 0.0).then(|| {
+            Self::compute_blur_base(
+                color_buffer,
+                width,
+                height,
+                CREATIVE_WORK_MAX,
+                GLOW_RADIUS_FRAC,
+            )
+        });
+
+        // Tighter low-pass for Halation (red bleed stays close to the highlight).
+        let halation_blur = (settings.halation > 0.0).then(|| {
+            Self::compute_blur_base(
+                color_buffer,
+                width,
+                height,
+                HALATION_WORK_MAX,
+                HALATION_RADIUS_FRAC,
+            )
+        });
+
+        // Light-flare map: depends only on the input, so it is built once and
+        // reused while the amount slider moves.
+        let flare_base =
+            (settings.flare > 0.0).then(|| flare::generate(color_buffer, width, height));
+
         SpatialBase {
             sharpen_blur,
             texture_base,
             noise_base,
             mask_base,
+            wide_blur,
+            halation_blur,
+            flare_base,
         }
     }
 
@@ -355,6 +404,10 @@ impl TinyLumaApp {
         let n_clarity = s.clarity / 100.0; // -1.0 .. 1.0
         let n_sharpen = s.sharpen / 100.0; // 0.0 .. 1.5
         let n_masking = (s.detail_masking / 100.0).clamp(0.0, 1.0);
+        let n_structure = s.structure / 100.0; // -1.0 .. 1.0
+        let n_glow = s.glow / 100.0; // 0.0 .. 1.0
+        let n_halation = s.halation / 100.0; // 0.0 .. 1.0
+        let n_flare = s.flare / 100.0; // 0.0 .. 1.0
 
         // Per-pixel noise-reduction plan (chroma mix / luma mix + soft thresholds).
         let nr_plan = noise::plan(&s.noise);
@@ -500,6 +553,35 @@ impl TinyLumaApp {
                 }
 
                 // ==========================================
+                // 🌄 STRUCTURE (broad local contrast)
+                // ==========================================
+                // Uses the wide low-pass reference (shared with Glow). The
+                // larger radius than Clarity gives HDR-like midtone punch
+                // instead of micro-contrast.
+                if n_structure.abs() > 1e-6 {
+                    if let Some(wide) = &spatial_base.wide_blur {
+                        let blurred = Self::sample_texture_base(wide, x, y, width, height);
+                        let base_luma =
+                            0.2126 * blurred[0] + 0.7152 * blurred[1] + 0.0722 * blurred[2];
+                        let luma_now = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                        // Masking tames only the positive (contrast-adding)
+                        // direction; negative Structure is softening.
+                        let amount = if n_structure > 0.0 {
+                            n_structure * detail_mask
+                        } else {
+                            n_structure
+                        };
+                        if luma_now > 0.001 {
+                            let final_luma = creative::apply_structure(luma_now, base_luma, amount);
+                            let gain = final_luma / luma_now;
+                            r = (r * gain).clamp(0.0, 1.0);
+                            g = (g * gain).clamp(0.0, 1.0);
+                            b = (b * gain).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+
+                // ==========================================
                 // 📸 SHARPENING (Unsharp Mask)
                 // ==========================================
                 // Sharpen goes last among the details (after Texture/Clarity),
@@ -527,6 +609,39 @@ impl TinyLumaApp {
                         r = (r * ratio).clamp(0.0, 1.0);
                         g = (g * ratio).clamp(0.0, 1.0);
                         b = (b * ratio).clamp(0.0, 1.0);
+                    }
+                }
+
+                // ==========================================
+                // ✨ CREATIVE: GLOW / HALATION / LIGHT FLARES
+                // ==========================================
+                // Additive light from a cached low-pass reference, in the
+                // RapidRAW order: Glow, then Halation, then Flares.
+                if n_glow > 0.0 {
+                    if let Some(wide) = &spatial_base.wide_blur {
+                        let blurred = Self::sample_texture_base(wide, x, y, width, height);
+                        let out = creative::apply_glow([r, g, b], blurred, n_glow);
+                        r = out[0].clamp(0.0, 1.0);
+                        g = out[1].clamp(0.0, 1.0);
+                        b = out[2].clamp(0.0, 1.0);
+                    }
+                }
+                if n_halation > 0.0 {
+                    if let Some(hal) = &spatial_base.halation_blur {
+                        let blurred = Self::sample_texture_base(hal, x, y, width, height);
+                        let out = creative::apply_halation([r, g, b], blurred, n_halation);
+                        r = out[0].clamp(0.0, 1.0);
+                        g = out[1].clamp(0.0, 1.0);
+                        b = out[2].clamp(0.0, 1.0);
+                    }
+                }
+                if n_flare > 0.0 {
+                    if let Some(fb) = &spatial_base.flare_base {
+                        let f = fb.sample(x, y, width, height);
+                        let out = flare::apply_flare([r, g, b], f, n_flare);
+                        r = out[0].clamp(0.0, 1.0);
+                        g = out[1].clamp(0.0, 1.0);
+                        b = out[2].clamp(0.0, 1.0);
                     }
                 }
 
@@ -801,6 +916,67 @@ impl TinyLumaApp {
 
         TextureBase {
             data: out,
+            sw,
+            sh,
+        }
+    }
+
+    /// Reduced-resolution Gaussian RGB base, sampled bilinearly by the pixel
+    /// loop. Used by Glow, Structure and Halation as a low-pass reference.
+    ///
+    /// The source is box-downsampled in **linear** light (so highlight energy
+    /// is preserved) and stored back in display sRGB, then each channel is
+    /// blurred with a resolution-independent radius.
+    fn compute_blur_base(
+        color: &[u8],
+        w: usize,
+        h: usize,
+        work_max: usize,
+        radius_frac: f32,
+    ) -> TextureBase {
+        let scale = (w.max(h) as f32 / work_max as f32).max(1.0);
+        let sw = ((w as f32 / scale).round() as usize).max(1);
+        let sh = ((h as f32 / scale).round() as usize).max(1);
+        let sx = w as f32 / sw as f32;
+        let sy = h as f32 / sh as f32;
+
+        let mut small = vec![0.0f32; sw * sh * 3];
+        small.par_chunks_mut(3).enumerate().for_each(|(i, o)| {
+            let dx = i % sw;
+            let dy = i / sw;
+            let x0 = (dx as f32 * sx) as usize;
+            let x1 = (((dx + 1) as f32 * sx) as usize).clamp(x0 + 1, w);
+            let y0 = (dy as f32 * sy) as usize;
+            let y1 = (((dy + 1) as f32 * sy) as usize).clamp(y0 + 1, h);
+            let mut acc = [0.0f32; 3];
+            let mut cnt = 0.0f32;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let b = (y * w + x) * 3;
+                    acc[0] += srgb_to_linear(color[b] as f32 / 255.0);
+                    acc[1] += srgb_to_linear(color[b + 1] as f32 / 255.0);
+                    acc[2] += srgb_to_linear(color[b + 2] as f32 / 255.0);
+                    cnt += 1.0;
+                }
+            }
+            let inv = 1.0 / cnt.max(1.0);
+            o[0] = linear_to_srgb(acc[0] * inv);
+            o[1] = linear_to_srgb(acc[1] * inv);
+            o[2] = linear_to_srgb(acc[2] * inv);
+        });
+
+        let radius = (radius_frac * sw.min(sh) as f32).max(1.0);
+        let mut data = vec![0.0f32; sw * sh * 3];
+        for c in 0..3 {
+            let plane: Vec<f32> = small.par_chunks(3).map(|p| p[c]).collect();
+            let blurred = Self::gaussian_blur_map(&plane, sw, sh, radius);
+            data.par_chunks_mut(3).enumerate().for_each(|(i, o)| {
+                o[c] = blurred[i];
+            });
+        }
+
+        TextureBase {
+            data,
             sw,
             sh,
         }
@@ -1114,7 +1290,11 @@ impl TinyLumaApp {
 
         let needs_spatial = settings.texture != 0.0
             || settings.clarity != 0.0
+            || settings.structure != 0.0
             || settings.sharpen > 0.0
+            || settings.glow > 0.0
+            || settings.halation > 0.0
+            || settings.flare > 0.0
             || settings.grain != 0.0
             || !settings.noise.is_identity()
             || !settings.vignette.is_identity();
@@ -1212,7 +1392,11 @@ impl TinyLumaApp {
 
         let needs_spatial = self.settings.texture != 0.0
             || self.settings.clarity != 0.0
+            || self.settings.structure != 0.0
             || self.settings.sharpen > 0.0
+            || self.settings.glow > 0.0
+            || self.settings.halation > 0.0
+            || self.settings.flare > 0.0
             || self.settings.grain > 0.0
             || !self.settings.noise.is_identity()
             || !self.settings.vignette.is_identity();
@@ -1366,7 +1550,12 @@ impl TinyLumaApp {
                 || (self.settings.sharpen > 0.0 && self.spatial_base.sharpen_blur.is_none())
                 || (!self.settings.noise.is_identity() && self.spatial_base.noise_base.is_none())
                 || (self.settings.detail_masking > 0.0
-                    && self.spatial_base.mask_base.is_none()))
+                    && self.spatial_base.mask_base.is_none())
+                || ((self.settings.glow > 0.0 || self.settings.structure != 0.0)
+                    && self.spatial_base.wide_blur.is_none())
+                || (self.settings.halation > 0.0
+                    && self.spatial_base.halation_blur.is_none())
+                || (self.settings.flare > 0.0 && self.spatial_base.flare_base.is_none()))
         {
             let input: &[u8] = if has_dehaze_active {
                 &self.dehazed_buffer
@@ -1597,6 +1786,52 @@ mod tests {
         s.highlights = -60.0;
         TinyLumaApp::run_color_pass(&s, None, &mut buf);
         assert!(buf[0] < 230, "highlights- should recover: {}", buf[0]);
+    }
+
+    #[test]
+    fn creative_effects_change_output() {
+        let (w, h) = (64usize, 48usize);
+        let mut color = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let b = (y * w + x) * 3;
+                let v = (x as f32 / w as f32 * 255.0) as u8;
+                color[b] = v;
+                color[b + 1] = v;
+                color[b + 2] = v;
+            }
+        }
+        // A blown highlight that the glow/halation/flare references can find.
+        for y in 20..28 {
+            for x in 28..36 {
+                let b = (y * w + x) * 3;
+                color[b] = 255;
+                color[b + 1] = 255;
+                color[b + 2] = 255;
+            }
+        }
+
+        let luma = TinyLumaApp::compute_luma_map(&color);
+        let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
+        let grain = vec![0.0f32; w * h * 2];
+
+        let mut s = FilterSettings::default();
+        s.structure = 60.0;
+        s.glow = 80.0;
+        s.halation = 70.0;
+        s.flare = 80.0;
+
+        let mut out = vec![0u8; w * h * 3];
+        TinyLumaApp::run_spatial_pass(
+            &s, &color, &mut out, &grain, &luma, &clarity, sw, sh, w, h,
+        );
+
+        let diff = out
+            .iter()
+            .zip(color.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(diff > 0, "creative effects did not change the frame");
     }
 
     #[test]

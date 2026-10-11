@@ -220,6 +220,23 @@ pub(crate) struct FilterSettings {
     /// loading as a no-op.
     #[serde(default)]
     pub(crate) vignette: VignetteSettings,
+
+    /// Creative glow (bloom) around highlights, `0..=100`. Spatial pass (needs a
+    /// blurred reference); `serde(default)` keeps older presets loading.
+    #[serde(default)]
+    pub(crate) glow: f32,
+    /// Creative halation (red bleed from the brightest highlights), `0..=100`.
+    /// Spatial pass; `serde(default)` keeps older presets loading.
+    #[serde(default)]
+    pub(crate) halation: f32,
+    /// Creative light flares, `0..=100`. Spatial pass; the flare map is built
+    /// once per input and cached. `serde(default)` keeps older presets loading.
+    #[serde(default)]
+    pub(crate) flare: f32,
+    /// Structure: broad local contrast on top of Clarity, `-100..=100`.
+    /// Spatial pass; `serde(default)` keeps older presets loading.
+    #[serde(default)]
+    pub(crate) structure: f32,
 }
 
 impl Default for FilterSettings {
@@ -253,6 +270,10 @@ impl Default for FilterSettings {
             noise: NoiseSettings::default(),
             grading: ColorGrading::default(),
             vignette: VignetteSettings::default(),
+            glow: 0.0,
+            halation: 0.0,
+            flare: 0.0,
+            structure: 0.0,
         }
     }
 }

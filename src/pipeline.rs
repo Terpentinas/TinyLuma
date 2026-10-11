@@ -7,8 +7,10 @@
 //! the application's combined 3D LUT (`run_color_pass`/`bake_combined_lut`).
 
 pub(crate) mod color;
+pub(crate) mod creative;
 pub(crate) mod curve;
 pub(crate) mod dehaze;
+pub(crate) mod flare;
 pub(crate) mod grading;
 pub(crate) mod grain;
 pub(crate) mod hsl;

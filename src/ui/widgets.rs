@@ -590,6 +590,15 @@ fn labeled_slider_impl(
     let mut is_dragging = false;
     let right_padding = 3.0; // Right padding so it does not touch the scrollbar
 
+    // Whole-number sliders snap to integers; only narrow ranges where integers
+    // would be too coarse (Exposure, -5..=5) keep a decimal step.
+    let step = if (*range.end() - *range.start()).abs() >= 20.0 {
+        1.0
+    } else {
+        0.1
+    };
+    let decimals = if step >= 1.0 { 0 } else { 1 };
+
     ui.vertical(|ui| {
         // --- TOP ROW ---
         ui.horizontal(|ui| {
@@ -625,7 +634,11 @@ fn labeled_slider_impl(
                 // Add padding BEFORE the DragValue (since we are in right_to_left, this will be the far right corner)
                 ui.add_space(right_padding);
 
-                let drag = ui.add(egui::DragValue::new(value).speed(0.1).max_decimals(2));
+                let drag = ui.add(
+                    egui::DragValue::new(value)
+                        .speed(step)
+                        .max_decimals(decimals),
+                );
                 if drag.changed() {
                     *value = value.clamp(*range.start(), *range.end());
                     changed = true;
@@ -641,38 +654,20 @@ fn labeled_slider_impl(
             // Subtract the padding from the total slider width
             ui.spacing_mut().slider_width = ui.available_width() - right_padding;
 
-            match gradient {
-                Some(stops) => {
-                    let (c, d) = axis_slider(ui, value, range, default, stops);
-                    changed |= c;
-                    is_dragging |= d;
-                }
-                None => {
-                    let slider_resp = ui.add(
-                        egui::Slider::new(value, range)
-                            .show_value(false)
-                            .trailing_fill(true),
-                    );
-                    // Double-click (left or right) on the slider resets it to its default
-                    // value. The Slider only senses drags (not clicks), so `Response::clicked`
-                    // never fires — we read the double-click straight from the pointer state
-                    // and make sure the cursor is over this slider.
-                    let double_clicked = ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                            || i.pointer.button_double_clicked(egui::PointerButton::Secondary)
-                    });
-                    if double_clicked && slider_resp.hovered() && *value != default {
-                        *value = default;
-                        changed = true;
-                    }
-                    if slider_resp.changed() {
-                        changed = true;
-                    }
-                    if slider_resp.dragged() {
-                        is_dragging = true;
-                    }
-                }
-            }
+            // Bipolar sliders (a negative range) fill from their neutral value,
+            // so at the default the rail is uncoloured; unipolar sliders keep
+            // filling from the minimum. Gradient rails never carry a fill.
+            let fill_origin = if gradient.is_some() {
+                None
+            } else if *range.start() < 0.0 {
+                Some(default)
+            } else {
+                Some(*range.start())
+            };
+
+            let (c, d) = rail_slider(ui, value, range, default, gradient, fill_origin, step);
+            changed |= c;
+            is_dragging |= d;
         });
     });
 
@@ -680,15 +675,32 @@ fn labeled_slider_impl(
     (changed, is_dragging)
 }
 
-/// Horizontal slider whose rail is a colour gradient. Click/drag sets the value;
-/// double-click resets to `default`; the handle matches the stock egui slider so
-/// it blends with the rest of the panel. Returns `(changed, is_dragging)`.
-fn axis_slider(
+/// Rounds `value` to the nearest `step` on a grid anchored at `min`, killing
+/// floating-point dust so a snapped `0` is exactly `0`.
+fn snap_to_step(value: f32, min: f32, step: f32) -> f32 {
+    if step <= 0.0 {
+        return value;
+    }
+    let n = ((value - min) / step).round();
+    let v = min + n * step;
+    let factor = if step >= 1.0 { 1.0 } else { 100.0 };
+    (v * factor).round() / factor
+}
+
+/// Horizontal slider used for every parameter rail. Draws either a colour
+/// gradient (`stops`) or a solid theme rail; `fill_origin` paints an accent
+/// segment from that value to the handle (so bipolar sliders stay uncoloured at
+/// their neutral value). Click/drag sets the value; double-click resets to
+/// `default`; the handle matches the stock egui slider. Returns
+/// `(changed, is_dragging)`.
+pub(crate) fn rail_slider(
     ui: &mut egui::Ui,
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
     default: f32,
-    stops: &[egui::Color32],
+    stops: Option<&[egui::Color32]>,
+    fill_origin: Option<f32>,
+    step: f32,
 ) -> (bool, bool) {
     let min = *range.start();
     let max = *range.end();
@@ -711,7 +723,7 @@ fn axis_slider(
     let mut changed = false;
     if let Some(p) = response.interact_pointer_pos() {
         let t = ((p.x - track.min) / (track.max - track.min)).clamp(0.0, 1.0);
-        let new = min + t * span;
+        let new = snap_to_step(min + t * span, min, step).clamp(min, max);
         if new != *value {
             *value = new;
             changed = true;
@@ -732,14 +744,66 @@ fn axis_slider(
 
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact(&response);
-        paint_gradient_rail(ui.painter(), rail, stops);
+        let base = theme::SLIDER_RAIL;
+        let rounding = ui.visuals().widgets.inactive.rounding;
+        let accent = ui.visuals().selection.bg_fill;
 
-        let t = if span > 0.0 {
-            ((*value - min) / span).clamp(0.0, 1.0)
+        let x_of = |t: f32| egui::lerp(track.min..=track.max, t.clamp(0.0, 1.0));
+        let value_t = if span > 0.0 {
+            (*value - min) / span
         } else {
             0.0
         };
-        let center = egui::pos2(egui::lerp(track.min..=track.max, t), rect.center().y);
+
+        match stops {
+            Some(stops) => paint_gradient_rail(ui.painter(), rail, stops),
+            None => {
+                ui.painter().rect_filled(rail, rounding, base);
+            }
+        }
+
+        // Fill from the neutral origin to the current value, fading out toward
+        // the origin so there is no hard "volume bar". Unipolar sliders start
+        // at their origin, so they fade from the left edge; bipolar sliders also
+        // get a short tick marking the neutral point.
+        if let Some(origin) = fill_origin {
+            let origin_t = if span > 0.0 {
+                ((origin - min) / span).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (xa, xb) = (x_of(origin_t), x_of(value_t));
+            let (left, right) = (xa.min(xb), xa.max(xb));
+
+            // Tick only where the origin sits strictly inside the rail.
+            if min < 0.0 && origin_t > 0.01 && origin_t < 0.99 {
+                let x = x_of(origin_t);
+                let half = rail.height() * 0.9;
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(x, rail.center().y - half),
+                        egui::pos2(x, rail.center().y + half),
+                    ],
+                    egui::Stroke::new(1.5, theme::with_alpha(theme::TEXT_SECONDARY, 170)),
+                );
+            }
+
+            let seg = egui::Rect::from_min_max(
+                egui::pos2(left, rail.top()),
+                egui::pos2(right, rail.bottom()),
+            );
+            if seg.width() > seg.height() {
+                let clear = egui::Color32::TRANSPARENT;
+                let fill_stops: [egui::Color32; 2] = if value_t >= origin_t {
+                    [clear, accent]
+                } else {
+                    [accent, clear]
+                };
+                paint_gradient_rail(ui.painter(), seg, &fill_stops);
+            }
+        }
+
+        let center = egui::pos2(x_of(value_t), rect.center().y);
         ui.painter().add(egui::epaint::CircleShape {
             center,
             radius: handle_radius + visuals.expansion,
@@ -748,15 +812,15 @@ fn axis_slider(
         });
     }
 
-    // Keyboard: arrows nudge by 1 (the DragValue handles typing/precision).
+    // Keyboard: arrows nudge by one step (the DragValue handles typing).
     if response.has_focus() {
-        let step = ui.input(|i| {
+        let nudge = ui.input(|i| {
             let up = i.num_presses(egui::Key::ArrowUp) + i.num_presses(egui::Key::ArrowRight);
             let down = i.num_presses(egui::Key::ArrowDown) + i.num_presses(egui::Key::ArrowLeft);
             up as f32 - down as f32
         });
-        if step != 0.0 {
-            *value = (*value + step).clamp(min, max);
+        if nudge != 0.0 {
+            *value = snap_to_step(*value + step * nudge, min, step).clamp(min, max);
             changed = true;
             response.mark_changed();
         }

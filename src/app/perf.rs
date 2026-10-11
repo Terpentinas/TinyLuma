@@ -62,10 +62,14 @@ enum Slider {
     Hue,
     VignetteAmount,
     GrainRoughness,
+    Structure,
+    Glow,
+    Halation,
+    Flare,
 }
 
 impl Slider {
-    const ALL: [Slider; 23] = [
+    const ALL: [Slider; 27] = [
         Slider::Exposure,
         Slider::Contrast,
         Slider::Whites,
@@ -89,6 +93,10 @@ impl Slider {
         Slider::Hue,
         Slider::VignetteAmount,
         Slider::GrainRoughness,
+        Slider::Structure,
+        Slider::Glow,
+        Slider::Halation,
+        Slider::Flare,
     ];
 
     fn name(self) -> &'static str {
@@ -116,6 +124,10 @@ impl Slider {
             Slider::Hue => "Hue",
             Slider::VignetteAmount => "VignetteAmount",
             Slider::GrainRoughness => "GrainRoughness",
+            Slider::Structure => "Structure",
+            Slider::Glow => "Glow",
+            Slider::Halation => "Halation",
+            Slider::Flare => "Flare",
         }
     }
 
@@ -170,6 +182,10 @@ impl Slider {
             Slider::Hue => s.hue += NUDGE,
             Slider::VignetteAmount => s.vignette.amount += NUDGE,
             Slider::GrainRoughness => s.grain_roughness += NUDGE,
+            Slider::Structure => s.structure += NUDGE,
+            Slider::Glow => s.glow += NUDGE,
+            Slider::Halation => s.halation += NUDGE,
+            Slider::Flare => s.flare += NUDGE,
         }
     }
 }
@@ -201,6 +217,10 @@ fn baseline_settings() -> FilterSettings {
         grain_roughness: 40.0,
         brightness: 20.0,
         hue: 40.0,
+        structure: 35.0,
+        glow: 30.0,
+        halation: 25.0,
+        flare: 20.0,
         vignette: crate::pipeline::vignette::VignetteSettings {
             amount: -40.0,
             ..Default::default()

@@ -52,6 +52,8 @@ Raw AI images (Stable Diffusion, Midjourney, Flux) often suffer from common arti
 - **Texture:** Edge-preserving bilateral separation. Extracts fine surface details (hair strands, fabric weave, skin pores) without amplifying noise or digital artifacts.
 - **Sharpen:** Asymmetric luma unsharp mask. Limits light-edge blooming (≤ 0.20) and dark ringing (≤ 0.12) to produce crisp, print-ready results.
 - **Film Grain:** Darktable-inspired 3-octave simplex noise mapped via paper-response curves, strongest in midtones to naturally break up AI surface banding.
+- **Structure:** Broad local contrast that adds HDR-like depth on top of Clarity, with soft-knee limiting to avoid halos.
+- **Creative Effects:** Photographic **Glow** (warm bloom), **Halation** (red highlight bleed) and **Light Flares** (starburst, anamorphic streak and ghosts) — a single slider each, all rendered from cached references for interactive performance.
 
 *All spatial radii scale dynamically to exported resolution, ensuring identical results between preview and full-res renders.*
 
@@ -69,6 +71,7 @@ Most editors silently wipe workflow metadata, while others force-embed it. TinyL
 | `\` | Toggle Before / After split screen |
 | `C` | Crop tool |
 | `J` | Spot Healing Brush |
+| `W` | White Balance picker (eyedropper) |
 | `Enter` | Apply the active tool's edits and leave it |
 | `Esc` | Discard the active tool's edits and leave it |
 | `[` / `]` | Brush size (Spot Healing Brush) |

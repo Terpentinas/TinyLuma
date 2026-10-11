@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use crate::app::TinyLumaApp;
 use crate::lut_library::LutEntry;
+use crate::ui::widgets::rail_slider;
 
 impl TinyLumaApp {
     /// Right panel: presets, active LUT and library. Returns
@@ -621,7 +622,7 @@ fn lut_strength_slider(ui: &mut egui::Ui, name: &str, value: &mut f32) -> (bool,
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(right_padding);
-            let drag = ui.add(egui::DragValue::new(value).speed(0.1).max_decimals(2));
+            let drag = ui.add(egui::DragValue::new(value).speed(1.0).max_decimals(0));
             if drag.changed() {
                 *value = value.clamp(0.0, 100.0);
                 changed = true;
@@ -632,31 +633,14 @@ fn lut_strength_slider(ui: &mut egui::Ui, name: &str, value: &mut f32) -> (bool,
         });
     });
 
-    // --- BOTTOM ROW: full-width slider ---
+    // --- BOTTOM ROW: full-width rail (same fade style as the panel sliders) ---
     ui.scope(|ui| {
         ui.spacing_mut().slider_width = ui.available_width() - right_padding;
-        let slider_resp = ui.add(
-            egui::Slider::new(value, 0.0..=100.0)
-                .show_value(false)
-                .trailing_fill(true),
-        );
-        // Double-click (left or right) resets the LUT strength to full (the value
-        // it gets when a LUT is selected). The Slider only senses drags, so we read
-        // the double-click from the pointer state and check the cursor is over it.
-        let double_clicked = ui.input(|i| {
-            i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                || i.pointer.button_double_clicked(egui::PointerButton::Secondary)
-        });
-        if double_clicked && slider_resp.hovered() && *value != 100.0 {
-            *value = 100.0;
-            changed = true;
-        }
-        if slider_resp.changed() {
-            changed = true;
-        }
-        if slider_resp.dragged() {
-            is_dragging = true;
-        }
+        // Double-click resets the LUT strength to full (the value it gets when a
+        // LUT is selected); the fade starts at 0.
+        let (c, d) = rail_slider(ui, value, 0.0..=100.0, 100.0, None, Some(0.0), 1.0);
+        changed |= c;
+        is_dragging |= d;
     });
 
     ui.add_space(6.0);
