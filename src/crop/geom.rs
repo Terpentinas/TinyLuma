@@ -9,8 +9,10 @@
 //! down). Normalized aspect is *not* the same as the pixel aspect: for an image
 //! of ratio `R = W/H`, a frame with pixel ratio `r` has `w/h = r / R`.
 
+use serde::{Deserialize, Serialize};
+
 /// A rectangle in normalized image space, `0..1`.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub(crate) struct NormRect {
     pub x: f32,
     pub y: f32,
@@ -89,7 +91,7 @@ impl NormRect {
 
 /// An aspect-ratio preset. Orientation is explicit (`Fixed(2, 3)` is portrait),
 /// so no separate orientation state is needed; a swap button flips the numbers.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub(crate) enum AspectPreset {
     Free,
     Original,

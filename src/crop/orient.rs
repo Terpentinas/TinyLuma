@@ -6,10 +6,12 @@
 //! clockwise", which is a complete representation of the dihedral group D4 and
 //! makes composition a few arithmetic lines.
 
+use serde::{Deserialize, Serialize};
+
 use super::geom::NormRect;
 
 /// A right-angle orientation: mirror + quarter turns. `Copy`, `Eq`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Orientation {
     /// Number of 90° clockwise turns, `0..3`.
     pub turns: u8,

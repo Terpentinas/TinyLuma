@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use super::TinyLumaApp;
-use crate::color::oklab::{linear_to_srgb, rgb_to_oklab, srgb_u8_linear_table};
+use crate::color::oklab::{
+    linear_to_srgb, oklab_to_linear_rgb, rgb_to_oklab, srgb_to_linear, srgb_u8_linear_table,
+};
 use crate::lut::Lut3D;
 use crate::pipeline::color::{ColorSettings, WhiteBalance, apply_chroma, gamut_map_linear};
 use crate::pipeline::curve::CurveTables;
@@ -16,6 +18,7 @@ use crate::pipeline::hsl::apply_hsl;
 use crate::pipeline::light::{
     LightSettings, apply_light, contrast_from_slider, exposure_from_slider, unit_from_slider,
 };
+use crate::pipeline::noise;
 use crate::retouch::RetouchLayer;
 use crate::settings::FilterSettings;
 
@@ -28,8 +31,31 @@ const DETAIL_WORK_MAX: usize = 1200;
 /// Downsample factor for Clarity at the reference resolution.
 const CLARITY_SCALE: usize = 8;
 
+/// Radius (px, at reduced resolution) of the shared detail mask's high-pass and
+/// its energy blur.
+const MASK_RADIUS: f32 = 2.0;
+/// Energy knee (luma²) of the detail mask: below it an area counts as flat.
+const MASK_KNEE2: f32 = 0.002;
+
 /// RGB texture base at working resolution (interleaved storage).
 pub(crate) struct TextureBase {
+    pub(crate) data: Vec<f32>,
+    pub(crate) sw: usize,
+    pub(crate) sh: usize,
+}
+
+/// Reduced-resolution planes for noise reduction: `[Oklab a, Oklab b, log2
+/// guided luminance]` interleaved, sampled bilinearly by the spatial pass.
+/// A wide chroma low-pass plus an edge-aware luminance guide.
+pub(crate) struct NoiseBase {
+    pub(crate) data: Vec<f32>,
+    pub(crate) sw: usize,
+    pub(crate) sh: usize,
+}
+
+/// Reduced-resolution per-pixel detail mask (`0..=1`): ~0 on flat/noisy areas,
+/// ~1 on textured areas/edges. Shared by Texture, Clarity and Sharpen.
+pub(crate) struct MaskBase {
     pub(crate) data: Vec<f32>,
     pub(crate) sw: usize,
     pub(crate) sh: usize,
@@ -43,6 +69,10 @@ pub(crate) struct TextureBase {
 pub(crate) struct SpatialBase {
     pub(crate) sharpen_blur: Option<Vec<f32>>,
     pub(crate) texture_base: Option<TextureBase>,
+    pub(crate) noise_base: Option<NoiseBase>,
+    /// Shared detail mask for Texture/Clarity/Sharpen (present only when
+    /// `detail_masking > 0`).
+    pub(crate) mask_base: Option<MaskBase>,
 }
 
 impl TinyLumaApp {
@@ -231,9 +261,22 @@ impl TinyLumaApp {
             None
         };
 
+        // Noise reduction: wide chroma low-pass + edge-aware luminance guide,
+        // both at reduced resolution. Radius is slider-independent (it only
+        // scales with the resolution) so slider drags re-mix without a re-blur.
+        let noise_base = (!settings.noise.is_identity())
+            .then(|| Self::compute_noise_base(color_buffer, luma_map, width, height, detail_scale));
+
+        // Shared detail mask for Texture/Clarity/Sharpen. Computed once from the
+        // (reduced-resolution) luma high-pass, only while masking is on.
+        let mask_base = (settings.detail_masking > 0.0)
+            .then(|| Self::compute_mask_base(luma_map, width, height, detail_scale));
+
         SpatialBase {
             sharpen_blur,
             texture_base,
+            noise_base,
+            mask_base,
         }
     }
 
@@ -285,6 +328,11 @@ impl TinyLumaApp {
         let n_texture = s.texture / 100.0; // -1.0 .. 1.0
         let n_clarity = s.clarity / 100.0; // -1.0 .. 1.0
         let n_sharpen = s.sharpen / 100.0; // 0.0 .. 1.5
+        let n_masking = (s.detail_masking / 100.0).clamp(0.0, 1.0);
+
+        // Per-pixel noise-reduction plan (chroma mix / luma mix + soft thresholds).
+        let nr_plan = noise::plan(&s.noise);
+        let noise_active = !s.noise.is_identity();
 
         // Read from color_buffer (stable color_pass result) — WITHOUT clone!
         let color_snapshot: &[u8] = color_buffer;
@@ -301,7 +349,50 @@ impl TinyLumaApp {
                 let mut g = color_snapshot[center_idx + 1] as f32 / 255.0;
                 let mut b = color_snapshot[center_idx + 2] as f32 / 255.0;
 
+                // ==========================================
+                // 🔇 NOISE REDUCTION (before Texture/Clarity/Sharpen)
+                // ==========================================
+                // The reference is precomputed and edge-aware: chroma is an Oklab
+                // a/b low-pass, luma a guided filter. Operating first means the
+                // detail stages below work on the cleaned image instead of
+                // amplifying the noise.
+                if noise_active {
+                    if let Some(nb) = &spatial_base.noise_base {
+                        let guide = Self::sample_noise_base(nb, x, y, width, height);
+                        if let Some(cp) = &nr_plan.chroma {
+                            let lin = [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)];
+                            let lab = rgb_to_oklab(lin[0], lin[1], lin[2]);
+                            let mixed =
+                                noise::blend_chroma([lab[1], lab[2]], [guide[0], guide[1]], cp);
+                            let out = oklab_to_linear_rgb(lab[0], mixed[0], mixed[1]);
+                            r = linear_to_srgb(out[0]).clamp(0.0, 1.0);
+                            g = linear_to_srgb(out[1]).clamp(0.0, 1.0);
+                            b = linear_to_srgb(out[2]).clamp(0.0, 1.0);
+                        }
+                        if let Some(lp) = &nr_plan.luma {
+                            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                            let cur_log = y.max(1e-4).log2();
+                            let gain = noise::luma_gain(cur_log, guide[2], lp);
+                            r = (r * gain).clamp(0.0, 1.0);
+                            g = (g * gain).clamp(0.0, 1.0);
+                            b = (b * gain).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+
+                // Luma after NR (used by Sharpen below; Clarity recomputes its own).
                 let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+                // Shared detail mask for Texture/Clarity/Sharpen: `1` when
+                // masking is off, else a soft gate that pulls the detail boosts
+                // out of flat/noisy areas while keeping real edges.
+                let detail_mask = match &spatial_base.mask_base {
+                    Some(mb) if n_masking > 0.0 => {
+                        let e = Self::sample_mask_base(mb, x, y, width, height);
+                        1.0 + n_masking * (e - 1.0)
+                    }
+                    _ => 1.0,
+                };
 
                 // TEXTURE
                 if let Some(tex) = &spatial_base.texture_base {
@@ -309,7 +400,14 @@ impl TinyLumaApp {
                     let blurred = Self::sample_texture_base(tex, x, y, width, height);
 
                     // Soft blend: original + (original − base) * strength.
+                    // Masking tames only the positive (detail-adding) direction;
+                    // negative Texture is smoothing and is left alone.
                     let strength = n_texture * 2.0;
+                    let strength = if n_texture > 0.0 {
+                        strength * detail_mask
+                    } else {
+                        strength
+                    };
                     r = (r + (r - blurred[0]) * strength).clamp(0.0, 1.0);
                     g = (g + (g - blurred[1]) * strength).clamp(0.0, 1.0);
                     b = (b + (b - blurred[2]) * strength).clamp(0.0, 1.0);
@@ -344,6 +442,13 @@ impl TinyLumaApp {
                         + b11 * wx * wy;
 
                     let amount = n_clarity;
+                    // Masking tames only positive Clarity (adding local
+                    // contrast); negative Clarity is softening and is left alone.
+                    let amount = if n_clarity > 0.0 {
+                        amount * detail_mask
+                    } else {
+                        amount
+                    };
                     let diff = luma - base_luma;
 
                     // (1) Soft clipping of the diff
@@ -385,7 +490,7 @@ impl TinyLumaApp {
                     };
 
                     let strength = n_sharpen * 4.0;
-                    let luma_delta = limited_hp * strength;
+                    let luma_delta = limited_hp * strength * detail_mask;
 
                     if luma > 0.001 {
                         let ratio = (luma + luma_delta) / luma;
@@ -650,6 +755,185 @@ impl TinyLumaApp {
         }
     }
 
+    /// Reduced-resolution base for noise reduction: Oklab `a`/`b` planes (wide
+    /// low-pass) plus a guided log2-luminance guide. Works at the same reduced
+    /// resolution as the Texture base, so the radius stays scale-invariant.
+    fn compute_noise_base(color: &[u8], luma: &[f32], w: usize, h: usize, scale: f32) -> NoiseBase {
+        let sw = ((w as f32 / scale).round() as usize).max(1);
+        let sh = ((h as f32 / scale).round() as usize).max(1);
+        let sx = w as f32 / sw as f32;
+        let sy = h as f32 / sh as f32;
+
+        // Downsample linear RGB and luma. Oklab is stored per small pixel as
+        // `[a, b, 0]` (the third slot is unused here).
+        let mut small_lab = vec![0.0f32; sw * sh * 3];
+        let mut small_luma = vec![0.0f32; sw * sh];
+        small_luma
+            .par_iter_mut()
+            .zip(small_lab.par_chunks_mut(3))
+            .enumerate()
+            .for_each(|(i, (lo, lab))| {
+                let dx = i % sw;
+                let dy = i / sw;
+                let x0 = (dx as f32 * sx) as usize;
+                let x1 = (((dx + 1) as f32 * sx) as usize).clamp(x0 + 1, w);
+                let y0 = (dy as f32 * sy) as usize;
+                let y1 = (((dy + 1) as f32 * sy) as usize).clamp(y0 + 1, h);
+                let (mut la, mut cnt) = (0.0f32, 0.0f32);
+                let mut acc = [0.0f32; 3];
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        la += luma[y * w + x];
+                        let b = (y * w + x) * 3;
+                        // Average in linear light, not sRGB.
+                        acc[0] += srgb_to_linear(color[b] as f32 / 255.0);
+                        acc[1] += srgb_to_linear(color[b + 1] as f32 / 255.0);
+                        acc[2] += srgb_to_linear(color[b + 2] as f32 / 255.0);
+                        cnt += 1.0;
+                    }
+                }
+                *lo = la / cnt;
+                let oklab = rgb_to_oklab(acc[0] / cnt, acc[1] / cnt, acc[2] / cnt);
+                lab[0] = oklab[1];
+                lab[1] = oklab[2];
+            });
+
+        // Wide chroma low-pass (a and b separately).
+        let a_plane: Vec<f32> = small_lab.par_chunks(3).map(|p| p[0]).collect();
+        let b_plane: Vec<f32> = small_lab.par_chunks(3).map(|p| p[1]).collect();
+        let a_plane = Self::gaussian_blur_map(&a_plane, sw, sh, noise::CHROMA_RADIUS);
+        let b_plane = Self::gaussian_blur_map(&b_plane, sw, sh, noise::CHROMA_RADIUS);
+
+        // Edge-aware log2-luminance guide (self-guided filter).
+        let guide = Self::guided_log_luma(&small_luma, sw, sh, noise::LUMA_RADIUS, noise::LUMA_EPS);
+
+        let mut data = vec![0.0f32; sw * sh * 3];
+        data.par_chunks_mut(3).enumerate().for_each(|(i, o)| {
+            o[0] = a_plane[i];
+            o[1] = b_plane[i];
+            o[2] = guide[i];
+        });
+
+        NoiseBase { data, sw, sh }
+    }
+
+    /// Self-guided filter (He et al.) on log2-luminance, one plane. Used as the
+    /// edge-aware luminance guide for noise reduction.
+    fn guided_log_luma(luma: &[f32], w: usize, h: usize, radius: f32, eps: f32) -> Vec<f32> {
+        let n = w * h;
+        let p: Vec<f32> = luma.par_iter().map(|y| y.max(1e-4).log2()).collect();
+        let mean = Self::gaussian_blur_map(&p, w, h, radius);
+        let p2: Vec<f32> = p.par_iter().map(|v| v * v).collect();
+        let corr = Self::gaussian_blur_map(&p2, w, h, radius);
+        let mut a = vec![0.0f32; n];
+        let mut b = vec![0.0f32; n];
+        a.par_iter_mut()
+            .zip(b.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (ai, bi))| {
+                let var = (corr[i] - mean[i] * mean[i]).max(0.0);
+                let g = var / (var + eps);
+                *ai = g;
+                *bi = mean[i] - g * mean[i];
+            });
+        let a_mean = Self::gaussian_blur_map(&a, w, h, radius);
+        let b_mean = Self::gaussian_blur_map(&b, w, h, radius);
+        (0..n).map(|i| a_mean[i] * p[i] + b_mean[i]).collect()
+    }
+
+    /// Bilinear sampling of the noise base (`[a, b, log2 guide]`).
+    fn sample_noise_base(base: &NoiseBase, x: usize, y: usize, w: usize, h: usize) -> [f32; 3] {
+        let (sw, sh) = (base.sw, base.sh);
+        let fx = (x as f32 + 0.5) * sw as f32 / w as f32 - 0.5;
+        let fy = (y as f32 + 0.5) * sh as f32 / h as f32 - 0.5;
+        let x0 = fx.floor();
+        let y0 = fy.floor();
+        let tx = fx - x0;
+        let ty = fy - y0;
+        let xi = |v: f32| (v as isize).clamp(0, sw as isize - 1) as usize;
+        let yi = |v: f32| (v as isize).clamp(0, sh as isize - 1) as usize;
+        let (xa, xb) = (xi(x0), xi(x0 + 1.0));
+        let (ya, yb) = (yi(y0), yi(y0 + 1.0));
+        let mut out = [0.0f32; 3];
+        for c in 0..3 {
+            let v00 = base.data[(ya * sw + xa) * 3 + c];
+            let v10 = base.data[(ya * sw + xb) * 3 + c];
+            let v01 = base.data[(yb * sw + xa) * 3 + c];
+            let v11 = base.data[(yb * sw + xb) * 3 + c];
+            let top = v00 * (1.0 - tx) + v10 * tx;
+            let bot = v01 * (1.0 - tx) + v11 * tx;
+            out[c] = top * (1.0 - ty) + bot * ty;
+        }
+        out
+    }
+
+    /// Shared detail-mask base: a reduced-resolution `0..=1` gate, ~0 on flat /
+    /// noisy areas and ~1 on texture/edges. Computed from a local high-pass
+    /// energy so fine noise averages out and the gate follows real structure.
+    fn compute_mask_base(luma: &[f32], w: usize, h: usize, scale: f32) -> MaskBase {
+        let sw = ((w as f32 / scale).round() as usize).max(1);
+        let sh = ((h as f32 / scale).round() as usize).max(1);
+        let sx = w as f32 / sw as f32;
+        let sy = h as f32 / sh as f32;
+
+        // Box-downsample luma.
+        let mut small = vec![0.0f32; sw * sh];
+        small.par_iter_mut().enumerate().for_each(|(i, out)| {
+            let dx = i % sw;
+            let dy = i / sw;
+            let x0 = (dx as f32 * sx) as usize;
+            let x1 = (((dx + 1) as f32 * sx) as usize).clamp(x0 + 1, w);
+            let y0 = (dy as f32 * sy) as usize;
+            let y1 = (((dy + 1) as f32 * sy) as usize).clamp(y0 + 1, h);
+            let mut acc = 0.0f32;
+            let mut cnt = 0.0f32;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    acc += luma[y * w + x];
+                    cnt += 1.0;
+                }
+            }
+            *out = acc / cnt;
+        });
+
+        // Local high-pass energy, then a soft gate.
+        let blur = Self::gaussian_blur_map(&small, sw, sh, MASK_RADIUS);
+        let hp2: Vec<f32> = small
+            .par_iter()
+            .zip(blur.par_iter())
+            .map(|(s, b)| {
+                let hp = s - b;
+                hp * hp
+            })
+            .collect();
+        let energy = Self::gaussian_blur_map(&hp2, sw, sh, MASK_RADIUS);
+        let data: Vec<f32> = energy.par_iter().map(|en| en / (en + MASK_KNEE2)).collect();
+
+        MaskBase { data, sw, sh }
+    }
+
+    /// Bilinear sampling of the shared detail mask.
+    fn sample_mask_base(base: &MaskBase, x: usize, y: usize, w: usize, h: usize) -> f32 {
+        let (sw, sh) = (base.sw, base.sh);
+        let fx = (x as f32 + 0.5) * sw as f32 / w as f32 - 0.5;
+        let fy = (y as f32 + 0.5) * sh as f32 / h as f32 - 0.5;
+        let x0 = fx.floor();
+        let y0 = fy.floor();
+        let tx = fx - x0;
+        let ty = fy - y0;
+        let xi = |v: f32| (v as isize).clamp(0, sw as isize - 1) as usize;
+        let yi = |v: f32| (v as isize).clamp(0, sh as isize - 1) as usize;
+        let (xa, xb) = (xi(x0), xi(x0 + 1.0));
+        let (ya, yb) = (yi(y0), yi(y0 + 1.0));
+        let v00 = base.data[ya * sw + xa];
+        let v10 = base.data[ya * sw + xb];
+        let v01 = base.data[yb * sw + xa];
+        let v11 = base.data[yb * sw + xb];
+        let top = v00 * (1.0 - tx) + v10 * tx;
+        let bot = v01 * (1.0 - tx) + v11 * tx;
+        top * (1.0 - ty) + bot * ty
+    }
+
     /// Luma map from an RGB buffer.
     pub(crate) fn compute_luma_map(buffer: &[u8]) -> Vec<f32> {
         buffer
@@ -780,7 +1064,8 @@ impl TinyLumaApp {
         let needs_spatial = settings.texture != 0.0
             || settings.clarity != 0.0
             || settings.sharpen > 0.0
-            || settings.grain != 0.0;
+            || settings.grain != 0.0
+            || !settings.noise.is_identity();
 
         if !needs_spatial {
             return color_buffer;
@@ -870,7 +1155,8 @@ impl TinyLumaApp {
         let needs_spatial = self.settings.texture != 0.0
             || self.settings.clarity != 0.0
             || self.settings.sharpen > 0.0
-            || self.settings.grain > 0.0;
+            || self.settings.grain > 0.0
+            || !self.settings.noise.is_identity();
 
         // During a COLOR slider drag the spatial pass is not recomputed:
         // this saves ~22 ms/frame, the full render happens on release.
@@ -1018,7 +1304,10 @@ impl TinyLumaApp {
             && self.luma_cache_valid
             && (!self.spatial_base_valid
                 || (self.settings.texture != 0.0 && self.spatial_base.texture_base.is_none())
-                || (self.settings.sharpen > 0.0 && self.spatial_base.sharpen_blur.is_none()))
+                || (self.settings.sharpen > 0.0 && self.spatial_base.sharpen_blur.is_none())
+                || (!self.settings.noise.is_identity() && self.spatial_base.noise_base.is_none())
+                || (self.settings.detail_masking > 0.0
+                    && self.spatial_base.mask_base.is_none()))
         {
             let input: &[u8] = if has_dehaze_active {
                 &self.dehazed_buffer
@@ -1384,6 +1673,235 @@ mod tests {
 
             assert_eq!(direct, cached, "tex={tex} sharp={sharp}");
         }
+    }
+
+    /// With the noise controls off the spatial pass must not touch a pixel.
+    #[test]
+    fn noise_identity_is_bit_identical() {
+        let (w, h) = (32usize, 24usize);
+        let color: Vec<u8> = (0..w * h * 3).map(|i| ((i * 11 + 3) % 256) as u8).collect();
+        let luma = TinyLumaApp::compute_luma_map(&color);
+        let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
+        let grain = vec![0.0f32; w * h];
+        let s = FilterSettings::default();
+        let mut out = vec![0u8; color.len()];
+        TinyLumaApp::run_spatial_pass(&s, &color, &mut out, &grain, &luma, &clarity, sw, sh, w, h);
+        assert_eq!(out, color, "identity noise settings changed pixels");
+    }
+
+    /// Chroma NR must reduce colour speckle on a flat patch.
+    #[test]
+    fn chroma_noise_reduction_reduces_colour_speckle() {
+        let (w, h) = (64usize, 64usize);
+        // Flat grey with alternating blue speckle (chroma noise).
+        let mut color = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                let speck = if (x + y) % 2 == 0 { 12.0f32 } else { -12.0f32 };
+                color.push(128);
+                color.push(128);
+                color.push((128.0 + speck).clamp(0.0, 255.0) as u8);
+            }
+        }
+        let luma = TinyLumaApp::compute_luma_map(&color);
+        let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
+        let grain = vec![0.0f32; w * h];
+
+        let mut s = FilterSettings::default();
+        s.noise.chroma = 100.0;
+        s.noise.detail = 50.0;
+        let mut out = vec![0u8; w * h * 3];
+        TinyLumaApp::run_spatial_pass(&s, &color, &mut out, &grain, &luma, &clarity, sw, sh, w, h);
+
+        let chroma_var = |buf: &[u8]| -> f32 {
+            let n = (w * h) as f32;
+            let v: Vec<f32> = buf.chunks(3).map(|p| p[2] as f32 - p[0] as f32).collect();
+            let mean = v.iter().sum::<f32>() / n;
+            v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n
+        };
+        let before = chroma_var(&color);
+        let after = chroma_var(&out);
+        assert!(
+            after < before * 0.5,
+            "chroma variance did not halve: {before} -> {after}"
+        );
+    }
+
+    /// Luma NR must smooth flat noise while keeping a hard edge intact.
+    #[test]
+    fn luma_noise_reduction_smooths_noise_and_keeps_edges() {
+        let (w, h) = (48usize, 48usize);
+        let mut color = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                let base = if x < w / 2 {
+                    // Deterministic ±5 noise on the flat left half.
+                    let n = ((y.wrapping_mul(2_654_435_761) ^ x.wrapping_mul(40_503)) >> 16) % 11;
+                    (100i32 - 5 + n as i32).clamp(0, 255) as u8
+                } else {
+                    156
+                };
+                color[i] = base;
+                color[i + 1] = base;
+                color[i + 2] = base;
+            }
+        }
+        let luma = TinyLumaApp::compute_luma_map(&color);
+        let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
+        let grain = vec![0.0f32; w * h];
+
+        let mut s = FilterSettings::default();
+        s.noise.luma = 100.0;
+        s.noise.detail = 50.0;
+        let mut out = vec![0u8; w * h * 3];
+        TinyLumaApp::run_spatial_pass(&s, &color, &mut out, &grain, &luma, &clarity, sw, sh, w, h);
+
+        // Variance of the flat noisy half (columns 4..w/2-4, avoiding the edge).
+        let left_var = |buf: &[u8]| -> f32 {
+            let mut v = Vec::new();
+            for y in 0..h {
+                for x in 4..w / 2 - 4 {
+                    v.push(buf[(y * w + x) * 3] as f32);
+                }
+            }
+            let mean = v.iter().sum::<f32>() / v.len() as f32;
+            v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / v.len() as f32
+        };
+        let before = left_var(&color);
+        let after = left_var(&out);
+        assert!(
+            after < before * 0.6,
+            "luma noise not reduced: variance {before} -> {after}"
+        );
+
+        // Edge contrast across the middle (rows away from the borders).
+        let px = |buf: &[u8], x: usize, y: usize| buf[(y * w + x) * 3] as i32;
+        let contrast = px(&out, w - 1, h / 2) - px(&out, 0, h / 2);
+        assert!(contrast > 40, "edge contrast lost: {contrast}");
+    }
+
+    /// Sharpen masking must not amplify noise on a flat patch.
+    #[test]
+    fn detail_masking_suppresses_flat_noise() {
+        let (w, h) = (48usize, 48usize);
+        let mut color = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let n = ((y.wrapping_mul(2_654_435_761) ^ x.wrapping_mul(40_503)) >> 16) % 11;
+                let v = (120i32 - 5 + n as i32).clamp(0, 255) as u8;
+                let i = (y * w + x) * 3;
+                color[i] = v;
+                color[i + 1] = v;
+                color[i + 2] = v;
+            }
+        }
+        let luma = TinyLumaApp::compute_luma_map(&color);
+        let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
+        let grain = vec![0.0f32; w * h];
+
+        let run = |masking: f32| -> Vec<u8> {
+            let mut s = FilterSettings::default();
+            s.sharpen = 100.0;
+            s.detail_masking = masking;
+            let mut out = vec![0u8; color.len()];
+            TinyLumaApp::run_spatial_pass(
+                &s, &color, &mut out, &grain, &luma, &clarity, sw, sh, w, h,
+            );
+            out
+        };
+        let variance = |buf: &[u8]| -> f32 {
+            let v: Vec<f32> = buf.chunks(3).map(|p| p[0] as f32).collect();
+            let mean = v.iter().sum::<f32>() / v.len() as f32;
+            v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / v.len() as f32
+        };
+
+        let unmasked = run(0.0);
+        let masked = run(100.0);
+        assert!(
+            variance(&masked) < variance(&unmasked) * 0.6,
+            "masking did not suppress noise: {} -> {}",
+            variance(&unmasked),
+            variance(&masked)
+        );
+    }
+
+    /// Sharpen masking must still sharpen a real edge.
+    #[test]
+    fn detail_masking_keeps_edges() {
+        let (w, h) = (48usize, 48usize);
+        let mut color = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let v = if x < w / 2 { 100u8 } else { 156u8 };
+                let i = (y * w + x) * 3;
+                color[i] = v;
+                color[i + 1] = v;
+                color[i + 2] = v;
+            }
+        }
+        let luma = TinyLumaApp::compute_luma_map(&color);
+        let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
+        let grain = vec![0.0f32; w * h];
+
+        let mut s = FilterSettings::default();
+        s.sharpen = 100.0;
+        s.detail_masking = 100.0;
+        let mut out = vec![0u8; color.len()];
+        TinyLumaApp::run_spatial_pass(&s, &color, &mut out, &grain, &luma, &clarity, sw, sh, w, h);
+
+        let px = |buf: &[u8], x: usize, y: usize| buf[(y * w + x) * 3] as i32;
+        let input_contrast = 156 - 100;
+        let contrast = px(&out, w / 2, h / 2) - px(&out, w / 2 - 1, h / 2);
+        assert!(
+            contrast > input_contrast + 2,
+            "edge not sharpened under masking: {contrast} vs {input_contrast}"
+        );
+    }
+
+    /// The same shared mask tames the positive Texture boost on flat noise.
+    #[test]
+    fn detail_masking_suppresses_texture_noise() {
+        let (w, h) = (48usize, 48usize);
+        let mut color = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let n = ((y.wrapping_mul(2_654_435_761) ^ x.wrapping_mul(40_503)) >> 16) % 11;
+                let v = (120i32 - 5 + n as i32).clamp(0, 255) as u8;
+                let i = (y * w + x) * 3;
+                color[i] = v;
+                color[i + 1] = v;
+                color[i + 2] = v;
+            }
+        }
+        let luma = TinyLumaApp::compute_luma_map(&color);
+        let (clarity, sw, sh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
+        let grain = vec![0.0f32; w * h];
+
+        let run = |masking: f32| -> Vec<u8> {
+            let mut s = FilterSettings::default();
+            s.texture = 100.0;
+            s.detail_masking = masking;
+            let mut out = vec![0u8; color.len()];
+            TinyLumaApp::run_spatial_pass(
+                &s, &color, &mut out, &grain, &luma, &clarity, sw, sh, w, h,
+            );
+            out
+        };
+        let variance = |buf: &[u8]| -> f32 {
+            let v: Vec<f32> = buf.chunks(3).map(|p| p[0] as f32).collect();
+            let mean = v.iter().sum::<f32>() / v.len() as f32;
+            v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / v.len() as f32
+        };
+
+        let unmasked = run(0.0);
+        let masked = run(100.0);
+        assert!(
+            variance(&masked) < variance(&unmasked) * 0.6,
+            "masking did not tame Texture noise: {} -> {}",
+            variance(&unmasked),
+            variance(&masked)
+        );
     }
 
     /// Spatial pass budget (Sharpen+Texture+Clarity) at different

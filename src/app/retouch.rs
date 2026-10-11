@@ -364,6 +364,7 @@ impl TinyLumaApp {
         self.retouch_dirty = true;
         self.color_dirty = true;
         self.spatial_dirty = true;
+        self.mark_session_dirty();
         if let Some(path) = &self.image_path {
             self.preview_cache.drop_render(path);
         }

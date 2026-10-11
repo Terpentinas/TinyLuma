@@ -360,6 +360,10 @@ impl TinyLumaApp {
             open_lut_categories: self.open_lut_categories.clone(),
             brush_size: self.retouch.brush.size,
             brush_hardness: self.retouch.brush.hardness,
+            last_session_folder: self
+                .last_session_folder
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
         };
         if let Ok(json) = serde_json::to_string_pretty(&settings) {
             let _ = std::fs::write(&self.save_settings_path, json);

@@ -12,3 +12,4 @@ pub(crate) mod dehaze;
 pub(crate) mod grain;
 pub(crate) mod hsl;
 pub(crate) mod light;
+pub(crate) mod noise;

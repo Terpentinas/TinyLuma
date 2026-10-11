@@ -245,7 +245,7 @@ impl<'de> Deserialize<'de> for Curve {
 }
 
 /// The master curve plus the three per-channel curves.
-#[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Default, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct ToneCurves {
     pub(crate) master: Curve,

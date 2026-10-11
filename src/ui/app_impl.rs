@@ -26,6 +26,9 @@ impl eframe::App for TinyLumaApp {
     /// lost on close.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.lut_lib.save_favorites();
+        // Flush the durable per-frame state first (updates the hero resume
+        // pointer), then persist the config so it includes that pointer.
+        self.persist_session();
         self.save_save_settings();
     }
 
@@ -266,6 +269,7 @@ impl eframe::App for TinyLumaApp {
                     preset_name,
                 );
             }
+            self.mark_session_dirty();
         }
 
         // --- HISTORY: coalescing slider gestures ---
@@ -299,6 +303,7 @@ impl eframe::App for TinyLumaApp {
                     preset_name,
                 );
             }
+            self.mark_session_dirty();
             self.color_dirty = true;
             self.spatial_dirty = true;
             self.full_render_pending = true;
@@ -309,6 +314,7 @@ impl eframe::App for TinyLumaApp {
             if frame_start != self.snapshot() {
                 self.history.push(frame_start);
             }
+            self.mark_session_dirty();
         }
 
         self.was_dragging = self.drag_active;
@@ -327,6 +333,19 @@ impl eframe::App for TinyLumaApp {
 
         if self.color_dirty || self.spatial_dirty {
             ctx.request_repaint();
+        }
+
+        // Debounced session autosave (P0-4): let the edit gesture settle before
+        // writing the sidecar, so a drag does not write the file every frame.
+        const SESSION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(900);
+        if self.session_dirty && !self.drag_active {
+            let elapsed = self.last_session_change.elapsed();
+            if elapsed >= SESSION_DEBOUNCE {
+                self.persist_session();
+                self.session_dirty = false;
+            } else {
+                ctx.request_repaint_after(SESSION_DEBOUNCE - elapsed);
+            }
         }
     }
 }

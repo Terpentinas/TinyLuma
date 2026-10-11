@@ -3,6 +3,8 @@
 
 //! The undoable crop value and its preset logic.
 
+use serde::{Deserialize, Serialize};
+
 use super::geom::{area_preserving, largest_centered, AspectPreset, NormRect};
 use super::orient::{
     flip_rect_h, flip_rect_v, rotate_rect_ccw, rotate_rect_cw, Orientation,
@@ -16,7 +18,7 @@ pub(crate) const MAX_ANGLE: f32 = 45.0;
 /// This is the value stored in snapshots and in the per-image session; it is
 /// `Copy`, cheap to clone and cheap to compare. Everything transient (tool
 /// active, in-progress drag) lives in the app layer.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub(crate) struct Crop {
     /// The frame, in *oriented* space (after `orientation` and `angle`).
     pub rect: NormRect,

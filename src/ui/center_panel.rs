@@ -136,8 +136,11 @@ impl TinyLumaApp {
                 ui.vertical_centered(|ui| {
                     // Estimate the content height for vertical centering.
                     // The window is short — pin to the top (top_space = 0).
+                    // The resume row adds height only when a session exists.
                     const CONTENT_H: f32 = 330.0;
-                    let top_space = ((ui.available_height() - CONTENT_H) / 2.0).max(0.0);
+                    let has_resume = self.resume_label().is_some();
+                    let content_h = CONTENT_H + if has_resume { 68.0 } else { 0.0 };
+                    let top_space = ((ui.available_height() - content_h) / 2.0).max(0.0);
                     ui.add_space(top_space);
 
                     // --- App icon tile ---
@@ -219,6 +222,24 @@ impl TinyLumaApp {
                                 let gap = 10.0;
                                 let mut open_files = false;
                                 let mut open_folder = false;
+                                let mut continue_session = false;
+
+                                // --- Resume the last edited session (if any) ---
+                                // Sits above the open actions and reads as the
+                                // "welcome back" path, while opening stays primary.
+                                if let Some((name, edits)) = self.resume_label() {
+                                    if super::widgets::session_resume_row(
+                                        ui,
+                                        &name,
+                                        edits,
+                                        egui::vec2(ui.available_width(), 54.0),
+                                    )
+                                    .clicked()
+                                    {
+                                        continue_session = true;
+                                    }
+                                    ui.add_space(14.0);
+                                }
 
                                 ui.horizontal(|ui| {
                                     let total = btn_size.x * 2.0 + gap;
@@ -295,6 +316,28 @@ impl TinyLumaApp {
                                                 ToastKind::Warning,
                                                 "No supported images in this folder",
                                             );
+                                        } else {
+                                            self.open_images(paths, ctx);
+                                        }
+                                    }
+                                }
+
+                                // --- Continue the last edited session ---
+                                if continue_session {
+                                    if let Some(folder) = self.last_session_folder.clone() {
+                                        let paths =
+                                            crate::app::image_io::collect_images_from_folder(
+                                                &folder, false,
+                                            );
+                                        if paths.is_empty() {
+                                            self.notify(
+                                                ToastKind::Warning,
+                                                "No supported images in that folder",
+                                            );
+                                            // The folder is empty/gone — forget the session.
+                                            self.last_session_folder = None;
+                                            self.last_session_edits = 0;
+                                            self.save_save_settings();
                                         } else {
                                             self.open_images(paths, ctx);
                                         }

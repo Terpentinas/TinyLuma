@@ -13,6 +13,7 @@ mod pipeline;
 mod presets;
 mod retouch;
 mod session;
+mod session_store;
 mod settings;
 mod theme;
 mod ui;

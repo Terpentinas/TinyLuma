@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::pipeline::curve::ToneCurves;
 use crate::pipeline::hsl::HslSettings;
+use crate::pipeline::noise::NoiseSettings;
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Debug)]
 pub(crate) enum SaveFormat {
@@ -60,6 +61,12 @@ pub(crate) struct SaveSettings {
     /// Open/closed state of the COLOR MIXER group (own field, same reason).
     #[serde(default = "default_true")]
     pub(crate) open_mixer_group: bool,
+    /// Source folder of the most recent session that had edits. Powers the
+    /// hero-screen "Continue last session" button. `None` when the last
+    /// session had no edits (or its edits were reverted). `serde(default)`
+    /// keeps older configs loading.
+    #[serde(default)]
+    pub(crate) last_session_folder: Option<String>,
 }
 
 impl Default for SaveSettings {
@@ -79,6 +86,7 @@ impl Default for SaveSettings {
             brush_hardness: default_brush_hardness(),
             open_curve_group: default_true(),
             open_mixer_group: default_true(),
+            last_session_folder: None,
         }
     }
 }
@@ -131,7 +139,7 @@ pub(crate) fn default_grain_size() -> f32 {
 }
 
 /// All settings for a single image (the sliders).
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Debug)]
 pub(crate) struct FilterSettings {
     pub(crate) exposure: f32,
     pub(crate) contrast: f32,
@@ -148,6 +156,15 @@ pub(crate) struct FilterSettings {
     pub(crate) clarity: f32,
     pub(crate) dehaze: f32,
     pub(crate) sharpen: f32,
+    /// Shared detail masking, `0..=100`. `0` applies Texture/Clarity/Sharpen
+    /// everywhere (the previous behaviour); higher values confine the *positive*
+    /// (detail-boosting) part of those effects to textured areas, so flat AI
+    /// zones and residual noise are not amplified. Applied only to the positive
+    /// direction; smoothing (negative Texture/Clarity) is left alone.
+    /// `serde(default)` keeps older presets loading as a no-op; the alias keeps
+    /// the short-lived `sharpen_masking` key readable.
+    #[serde(default, alias = "sharpen_masking")]
+    pub(crate) detail_masking: f32,
     pub(crate) lut_intensity: f32,
     pub(crate) grain: f32,
     /// Grain scale, `0..100` (`50` = the historical fine grain). Larger values
@@ -166,6 +183,12 @@ pub(crate) struct FilterSettings {
     /// older presets loading as a no-op mixer.
     #[serde(default)]
     pub(crate) hsl: HslSettings,
+
+    /// Noise reduction (spatial pass, before Texture/Clarity/Sharpen): chroma
+    /// in Oklab and edge-aware luma. `serde(default)` keeps older presets
+    /// loading as a no-op.
+    #[serde(default)]
+    pub(crate) noise: NoiseSettings,
 }
 
 impl Default for FilterSettings {
@@ -187,11 +210,13 @@ impl Default for FilterSettings {
             clarity: 0.0,
             dehaze: 0.0,
             sharpen: 0.0,
+            detail_masking: 0.0,
             lut_intensity: 0.0,
             grain: 0.0,
             grain_size: default_grain_size(),
             curves: ToneCurves::default(),
             hsl: HslSettings::default(),
+            noise: NoiseSettings::default(),
         }
     }
 }

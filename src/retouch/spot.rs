@@ -4,6 +4,7 @@
 //! One heal spot, end to end.
 
 use image::RgbImage;
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -16,7 +17,7 @@ use super::raster::{FloatRegion, Rect};
 /// A single heal spot. Resolution-independent: the center is normalized to
 /// `0..1` and the radius to the longer image side, so the same layer applies
 /// identically to the preview and the full-resolution export.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub(crate) struct Spot {
     /// Center in image space, `0..1` (x right, y down).
     pub(crate) center: [f32; 2],
@@ -35,7 +36,7 @@ pub(crate) struct Spot {
     pub(crate) path: Option<Vec<[f32; 2]>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[allow(dead_code)] // v3 variant is part of the planned API.
 pub(crate) enum SpotKind {
     /// v1: find the best matching source offset around the spot and clone it.
@@ -49,7 +50,7 @@ pub(crate) enum SpotKind {
 }
 
 /// Ordered list of spots (the retouch layer). Undo/redo operates on this.
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, Debug)]
 pub(crate) struct RetouchLayer {
     pub(crate) spots: Vec<Spot>,
 }

@@ -465,6 +465,92 @@ pub(crate) fn icon_card_button(
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Full-width "Continue last session" row for the hero screen: a resume icon in
+/// a circle, the folder name and an "N edits · click to continue" subtitle,
+/// with a chevron on the right. Returns the click response. Styled to read as a
+/// prominent but calm secondary action next to the primary "Open Images".
+pub(crate) fn session_resume_row(
+    ui: &mut egui::Ui,
+    folder_name: &str,
+    edits: usize,
+    size: egui::Vec2,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hovered = response.hovered();
+    let rounding = theme::RADIUS_MD;
+
+    // Calm accent tint at rest, stronger on hover — same language as
+    // `icon_card_button`, but a two-line layout.
+    let (bg, border, circle_bg, glyph) = if hovered {
+        (
+            theme::with_alpha(theme::ACCENT, 34),
+            theme::ACCENT,
+            theme::ACCENT,
+            egui::Color32::WHITE,
+        )
+    } else {
+        (
+            theme::with_alpha(theme::ACCENT, 14),
+            theme::with_alpha(theme::ACCENT, 70),
+            theme::with_alpha(theme::ACCENT, 46),
+            theme::ACCENT,
+        )
+    };
+
+    let p = ui.painter();
+    p.rect_filled(rect, rounding, bg);
+    p.rect_stroke(rect.shrink(0.5), rounding, egui::Stroke::new(1.0, border));
+
+    let pad = 12.0;
+    let circle_r = 15.0;
+    let circle_c = egui::pos2(rect.left() + pad + circle_r, rect.center().y);
+    p.circle_filled(circle_c, circle_r, circle_bg);
+    p.text(
+        circle_c,
+        egui::Align2::CENTER_CENTER,
+        ph::CLOCK_COUNTER_CLOCKWISE,
+        egui::FontId::proportional(16.0),
+        glyph,
+    );
+
+    let text_x = circle_c.x + circle_r + 10.0;
+    let title = p.layout_no_wrap(
+        folder_name.to_owned(),
+        egui::FontId::proportional(14.0),
+        theme::TEXT,
+    );
+    let noun = if edits == 1 { "edit" } else { "edits" };
+    let sub = p.layout_no_wrap(
+        format!("{edits} {noun} · click to continue"),
+        egui::FontId::proportional(11.5),
+        theme::TEXT_TERTIARY,
+    );
+    let line_gap = 3.0;
+    let title_h = title.size().y;
+    let top = rect.center().y - (title_h + line_gap + sub.size().y) * 0.5;
+    p.galley(egui::pos2(text_x, top), title, theme::TEXT);
+    p.galley(
+        egui::pos2(text_x, top + title_h + line_gap),
+        sub,
+        theme::TEXT_TERTIARY,
+    );
+
+    // A chevron signals "open".
+    p.text(
+        egui::pos2(rect.right() - pad, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        ph::CARET_RIGHT,
+        egui::FontId::proportional(15.0),
+        if hovered {
+            theme::ACCENT
+        } else {
+            theme::TEXT_TERTIARY
+        },
+    );
+
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Slider with a label, a reset button and an input field.
 /// Returns `(changed, is_dragging)`.
 pub(crate) fn labeled_slider(

@@ -338,5 +338,6 @@ impl TinyLumaApp {
         if let Some(path) = self.image_path.clone() {
             self.session.save_crop(&path, self.crop.crop);
         }
+        self.mark_session_dirty();
     }
 }

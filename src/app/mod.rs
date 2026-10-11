@@ -24,6 +24,7 @@ pub(crate) mod histogram;
 pub(crate) mod clipping;
 pub(crate) mod crop;
 pub(crate) mod retouch;
+pub(crate) mod persist;
 #[cfg(test)]
 mod perf;
 
@@ -178,6 +179,14 @@ pub(crate) struct TinyLumaApp {
     pub(crate) embed_png_metadata: bool,
     pub(crate) preset_manager: PresetManager,
     pub(crate) session: Session,
+    /// Autosave bookkeeping for the session sidecar (P0-4): whether there are
+    /// unsaved changes and when the debounce timer was last reset.
+    pub(crate) session_dirty: bool,
+    pub(crate) last_session_change: Instant,
+    /// Source folder of the most recent edited session (hero "Continue" button).
+    pub(crate) last_session_folder: Option<PathBuf>,
+    /// Number of saved edits in that session (label only).
+    pub(crate) last_session_edits: usize,
     pub(crate) show_batch_progress: bool,
     pub(crate) batch_progress_message: String,
     pub(crate) batch_total: usize,
@@ -328,6 +337,7 @@ impl TinyLumaApp {
                 preset_name,
             );
         }
+        self.mark_session_dirty();
     }
 
     /// Applies a preset. Returns a warning if the preset's LUT could not be
@@ -530,6 +540,10 @@ impl TinyLumaApp {
             self.full_render_pending = true;
         }
 
+        if applied > 0 {
+            self.mark_session_dirty();
+        }
+
         (applied, warning)
     }
 
@@ -555,6 +569,11 @@ impl TinyLumaApp {
         lut_lib.load_favorites();
 
         let saved = Self::load_save_settings();
+
+        // Resume pointer for the hero screen: only keep it while the sidecar
+        // still exists and holds edits, otherwise the button is a dead end.
+        let (last_session_folder, last_session_edits) =
+            Self::load_last_session(saved.last_session_folder.clone());
 
         Self {
             settings: FilterSettings::default(),
@@ -664,6 +683,10 @@ impl TinyLumaApp {
             embed_png_metadata: saved.embed_png_metadata,
             preset_manager: PresetManager::new(),
             session: Session::new(),
+            session_dirty: false,
+            last_session_change: Instant::now(),
+            last_session_folder,
+            last_session_edits,
             show_batch_progress: false,
             batch_progress_message: String::new(),
             batch_total: 0,

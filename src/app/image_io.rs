@@ -312,6 +312,9 @@ impl TinyLumaApp {
                 preset_name,
             );
         }
+        // Persist the whole session before it is dropped, so reopening the
+        // folder can restore it (P0-4).
+        self.persist_session();
         self.close_image();
         self.session = Session::new();
         println!("🗑 Session cleared");
@@ -355,13 +358,22 @@ impl TinyLumaApp {
         self.session.image_list = paths;
         self.session.current_index = 0;
 
+        // Restore any edits from a previous run of this folder (P0-4): fills the
+        // per-file maps and may move `current_index` to the last viewed frame.
+        self.restore_persisted_session();
+
         // Filmstrip thumbnails and preview prefetch run in the background (decode on separate threads)
         self.spawn_thumbnail_loader(paths_for_thumbs, ctx);
         self.spawn_prefetch_loader(paths_for_prefetch, ctx);
         self.filmstrip_needs_scroll = true;
 
-        // Load the first image
-        let first = self.session.image_list[0].clone();
+        // Load the first (or restored) image
+        let start_index = self.session.current_index.min(self.session.total() - 1);
+        self.session.current_index = start_index;
+        let first = self.session.image_list[start_index].clone();
+        // Apply the restored per-frame state (settings/LUT/preset/retouch/crop)
+        // before the first preview is rendered.
+        self.apply_session_state(&first);
         self.load_new_image(first, ctx);
         println!("📂 Loaded {} images", self.session.total());
     }
@@ -481,6 +493,10 @@ impl TinyLumaApp {
 
         // 6. Load the preview
         self.load_new_image(new_path, ctx);
+
+        // Autosave on a frame switch: the previous frame's edits are already in
+        // the session maps, and the new index must be remembered too.
+        self.persist_session();
     }
 
     /// Applies a frame's per-file data to the working state: settings, LUT,
@@ -598,6 +614,7 @@ impl TinyLumaApp {
         // stale, so restart prefetch on the current list.
         self.restart_prefetch(ctx);
 
+        self.mark_session_dirty();
         self.filmstrip_needs_scroll = true;
         ctx.request_repaint();
     }

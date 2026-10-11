@@ -476,6 +476,67 @@ impl TinyLumaApp {
                             if d {
                                 self.drag_active = true;
                             }
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Masking",
+                                &mut self.settings.detail_masking,
+                                0.0..=100.0,
+                                def.detail_masking,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+
+                            // --- NOISE subsection (chroma first: the AI artifact) ---
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!("{} NOISE", ph::WAVES))
+                                    .size(11.0)
+                                    .color(theme::TEXT_TERTIARY),
+                            );
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Chrominance",
+                                &mut self.settings.noise.chroma,
+                                0.0..=100.0,
+                                def.noise.chroma,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Luminance",
+                                &mut self.settings.noise.luma,
+                                0.0..=100.0,
+                                def.noise.luma,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
+                            let (c, d) = labeled_slider(
+                                ui,
+                                "Detail",
+                                &mut self.settings.noise.detail,
+                                0.0..=100.0,
+                                def.noise.detail,
+                            );
+                            if c {
+                                spatial_changed = true;
+                            }
+                            if d {
+                                self.drag_active = true;
+                            }
                         });
                     });
                     if details_open != self.open_groups[2] {
