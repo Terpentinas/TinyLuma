@@ -106,6 +106,23 @@ impl TinyLumaApp {
                             .color(theme::ACCENT),
                     );
                     child.label(egui::RichText::new("Heal").size(12.0).color(theme::TEXT));
+
+                    // Full-res work runs in the background. A subtle
+                    // spinner keeps the user informed without blocking painting.
+                    if self.retouch.full_loading || self.retouch.render_pending {
+                        child.add_space(8.0);
+                        child.spinner();
+                        let label = if self.retouch.full_loading {
+                            "Loading full-res…"
+                        } else {
+                            "Healing…"
+                        };
+                        child.label(
+                            egui::RichText::new(label)
+                                .size(12.0)
+                                .color(theme::TEXT_SECONDARY),
+                        );
+                    }
                     child.add_space(12.0);
 
                     // --- Size: number + slider ---

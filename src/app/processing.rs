@@ -5,8 +5,10 @@ use eframe::egui;
 use image::RgbImage;
 use rayon::prelude::*;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
+use super::proxy_job::{ProxyReply, ProxyRequest};
 use super::TinyLumaApp;
 use crate::color::oklab::{
     linear_to_srgb, oklab_to_linear_rgb, rgb_to_oklab, srgb_to_linear, srgb_u8_linear_table,
@@ -52,6 +54,39 @@ const GLOW_RADIUS_FRAC: f32 = 0.037;
 const HALATION_WORK_MAX: usize = 512;
 const HALATION_RADIUS_FRAC: f32 = 0.0074;
 
+/// Long side of the reduced-resolution interactive drag tier. While a
+/// spatial slider is dragged the pipeline runs at this size (~4x fewer pixels at
+/// the 1200px preview cap) and the smaller texture is stretched to the same
+/// on-screen size; the authoritative full-resolution render happens on release.
+const DRAG_WORK_MAX: usize = 640;
+
+/// Preview LUT resolution (drag *and* release). A 33³ grid is ~1/255 mean error,
+/// versus 64³ which only wins in the clipping worst case while costing ~18 ms on
+/// release. Export stays at 64³ ([`TinyLumaApp::bake_temp_lut`]) so files do not
+/// lose quality. Shared by the UI preview ([`TinyLumaApp::process_preview`]) and
+/// the background proxy render ([`TinyLumaApp::render_preview_at`]) so both tiers
+/// bake the same grid.
+const PREVIEW_LUT_SIZE: usize = 33;
+
+/// Resolution ladder for the interactive working proxy (long side, px).
+/// The proxy is sized to roughly the physical pixels the image covers on screen
+/// (`viewport · zoom · pixels_per_point`), snapped *up* to the next rung so a
+/// zoom change rebuilds the proxy at most once per rung (~1.5x apart) instead of
+/// on every wheel tick. Rung 0 doubles as the proxy floor.
+const PROXY_LADDER: [usize; 6] = [640, 960, 1280, 1920, 2560, 4096];
+/// Lower bound of the proxy long side. Small sources/viewports are never
+/// upscaled past this; it matches the drag tier so the two tiers compose cleanly.
+const PROXY_WORK_MIN: usize = DRAG_WORK_MAX;
+/// Highest resolution the interactive proxy *source* is decoded at. A
+/// larger image keeps a source at this cap — the proxy never exceeds it — while
+/// the export path still uses the full-size source.
+pub(crate) const SOURCE_WORK_MAX: usize = 4096;
+
+/// How long the viewport proxy waits, once the desired resolution stops
+/// changing (a zoom or window-size gesture), before rebuilding — so a fast wheel
+/// zoom rebuilds the proxy once instead of every tick.
+pub(crate) const PROXY_SETTLE: std::time::Duration = std::time::Duration::from_millis(180);
+
 /// RGB texture base at working resolution (interleaved storage).
 pub(crate) struct TextureBase {
     pub(crate) data: Vec<f32>,
@@ -95,6 +130,78 @@ pub(crate) struct SpatialBase {
     pub(crate) halation_blur: Option<TextureBase>,
     /// Precomputed light-flare map (present only when `flare > 0`).
     pub(crate) flare_base: Option<FlareBase>,
+}
+
+/// Scalar per-pixel parameters of the spatial pass, derived once per
+/// pass from the settings (so the staged detail/effects halves do not re-derive
+/// them per pixel).
+struct SpatialParams {
+    n_texture: f32,
+    n_clarity: f32,
+    n_sharpen: f32,
+    n_masking: f32,
+    n_structure: f32,
+    n_glow: f32,
+    n_halation: f32,
+    n_flare: f32,
+    nr_plan: noise::NrPlan,
+    noise_active: bool,
+    vignette: VignetteParams,
+    vignette_active: bool,
+    grain_amount: f32,
+    grain_roughness: f32,
+}
+
+impl SpatialParams {
+    fn new(s: &FilterSettings) -> Self {
+        let vignette = VignetteParams::new(&s.vignette);
+        Self {
+            n_texture: s.texture / 100.0, // -1.0 .. 1.0
+            n_clarity: s.clarity / 100.0, // -1.0 .. 1.0
+            n_sharpen: s.sharpen / 100.0, // 0.0 .. 1.5
+            n_masking: (s.detail_masking / 100.0).clamp(0.0, 1.0),
+            n_structure: s.structure / 100.0, // -1.0 .. 1.0
+            n_glow: s.glow / 100.0,           // 0.0 .. 1.0
+            n_halation: s.halation / 100.0,   // 0.0 .. 1.0
+            n_flare: s.flare / 100.0,         // 0.0 .. 1.0
+            nr_plan: noise::plan(&s.noise),
+            noise_active: !s.noise.is_identity(),
+            vignette_active: !vignette.is_identity(),
+            vignette,
+            grain_amount: s.grain,
+            grain_roughness: s.grain_roughness,
+        }
+    }
+}
+
+/// Persistent state for the reduced-resolution interactive drag tier.
+///
+/// The downscaled input and its precomputations (luma, clarity, spatial bases,
+/// grain) are rebuilt only when the input revision, the drag resolution or the
+/// base-affecting settings change (`tier_rev`). The f32 detail head is rebuilt
+/// only when its own signature changes (`detail_sig`), so an effects-only drag
+/// reuses it and skips the expensive detail work.
+#[derive(Default)]
+pub(crate) struct DragTier {
+    pub(crate) input: Vec<u8>,
+    pub(crate) clarity: Vec<f32>,
+    pub(crate) clarity_sw: usize,
+    pub(crate) clarity_sh: usize,
+    pub(crate) spatial_base: SpatialBase,
+    pub(crate) grain: Vec<f32>,
+    pub(crate) grain_dims: (usize, usize),
+    pub(crate) grain_key: (u32, bool),
+    pub(crate) grain_valid: bool,
+    /// f32 output of the detail head.
+    pub(crate) detail: Vec<f32>,
+    /// Signature the detail head was built for.
+    pub(crate) detail_sig: u64,
+    pub(crate) detail_valid: bool,
+    /// `tier_rev` the input/base/clarity caches were built for.
+    pub(crate) tier_rev: u64,
+    pub(crate) tier_valid: bool,
+    /// Final u8 drag output uploaded to the display texture.
+    pub(crate) output: Vec<u8>,
 }
 
 impl TinyLumaApp {
@@ -688,6 +795,828 @@ impl TinyLumaApp {
     }
 
     // ==========================================
+    // PHASE 3: STAGED SPATIAL PIPELINE
+    //
+    // The interactive drag tier splits the spatial pass into a *detail head*
+    // (noise reduction → Texture / Clarity / Structure / Sharpen) and an
+    // *effects tail* (Glow / Halation / Flare / Grain / Vignette). The head is
+    // cached in f32 so dragging an effects slider can skip the expensive detail
+    // work, and the tail reads the f32 head directly (no intermediate 8-bit
+    // round-trip). The two halves together are byte-identical to the monolithic
+    // `run_spatial_pass_with_base`; the `spatial_stages_match_monolithic` test
+    // guards that (keep the per-pixel math here in sync with the loop above).
+    // ==========================================
+
+    /// Detail head of the spatial pass for one pixel: noise reduction, then
+    /// Texture / Clarity / Structure / Sharpen. Returns display-referred f32 RGB.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn spatial_detail_pixel(
+        rgb: [f32; 3],
+        x: usize,
+        y: usize,
+        idx: usize,
+        base: &SpatialBase,
+        params: &SpatialParams,
+        clarity_base: &[f32],
+        clarity_sw: usize,
+        clarity_sh: usize,
+        width: usize,
+        height: usize,
+    ) -> [f32; 3] {
+        let (mut r, mut g, mut b) = (rgb[0], rgb[1], rgb[2]);
+
+        // 🔇 NOISE REDUCTION (before Texture/Clarity/Sharpen)
+        if params.noise_active {
+            if let Some(nb) = &base.noise_base {
+                let guide = Self::sample_noise_base(nb, x, y, width, height);
+                if let Some(cp) = &params.nr_plan.chroma {
+                    let lin = [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)];
+                    let lab = rgb_to_oklab(lin[0], lin[1], lin[2]);
+                    let mixed = noise::blend_chroma([lab[1], lab[2]], [guide[0], guide[1]], cp);
+                    let out = oklab_to_linear_rgb(lab[0], mixed[0], mixed[1]);
+                    r = linear_to_srgb(out[0]).clamp(0.0, 1.0);
+                    g = linear_to_srgb(out[1]).clamp(0.0, 1.0);
+                    b = linear_to_srgb(out[2]).clamp(0.0, 1.0);
+                }
+                if let Some(lp) = &params.nr_plan.luma {
+                    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    let cur_log = y.max(1e-4).log2();
+                    let gain = noise::luma_gain(cur_log, guide[2], lp);
+                    r = (r * gain).clamp(0.0, 1.0);
+                    g = (g * gain).clamp(0.0, 1.0);
+                    b = (b * gain).clamp(0.0, 1.0);
+                }
+            }
+        }
+
+        // Luma after NR (used by Sharpen below; Clarity recomputes its own).
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+        // Shared detail mask for Texture/Clarity/Sharpen.
+        let detail_mask = match &base.mask_base {
+            Some(mb) if params.n_masking > 0.0 => {
+                let e = Self::sample_mask_base(mb, x, y, width, height);
+                1.0 + params.n_masking * (e - 1.0)
+            }
+            _ => 1.0,
+        };
+
+        // TEXTURE
+        if let Some(tex) = &base.texture_base {
+            let blurred = Self::sample_texture_base(tex, x, y, width, height);
+            let strength = params.n_texture * 2.0;
+            let strength = if params.n_texture > 0.0 {
+                strength * detail_mask
+            } else {
+                strength
+            };
+            r = (r + (r - blurred[0]) * strength).clamp(0.0, 1.0);
+            g = (g + (g - blurred[1]) * strength).clamp(0.0, 1.0);
+            b = (b + (b - blurred[2]) * strength).clamp(0.0, 1.0);
+        }
+
+        // ---- CLARITY PRO (Logarithmic Local Contrast) ----
+        if params.n_clarity != 0.0 && !clarity_base.is_empty() {
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let scale = Self::clarity_scale(width, height);
+            let fx = x as f32 / scale as f32;
+            let fy = y as f32 / scale as f32;
+
+            let x0 = (fx as usize).min(clarity_sw - 1);
+            let y0 = (fy as usize).min(clarity_sh - 1);
+            let x1 = (x0 + 1).min(clarity_sw - 1);
+            let y1 = (y0 + 1).min(clarity_sh - 1);
+            let wx = fx - x0 as f32;
+            let wy = fy - y0 as f32;
+
+            let b00 = clarity_base[y0 * clarity_sw + x0];
+            let b10 = clarity_base[y0 * clarity_sw + x1];
+            let b01 = clarity_base[y1 * clarity_sw + x0];
+            let b11 = clarity_base[y1 * clarity_sw + x1];
+            let base_luma = b00 * (1.0 - wx) * (1.0 - wy)
+                + b10 * wx * (1.0 - wy)
+                + b01 * (1.0 - wx) * wy
+                + b11 * wx * wy;
+
+            let amount = params.n_clarity;
+            let amount = if params.n_clarity > 0.0 {
+                amount * detail_mask
+            } else {
+                amount
+            };
+            let diff = luma - base_luma;
+
+            let k = 10.0;
+            let safe_diff = diff / (1.0 + diff.abs() * k);
+
+            let local_contrast = diff.abs();
+            let edge_mask = 1.0 / (1.0 + local_contrast * 6.0);
+
+            let punch = 1.0;
+            let mut final_luma = luma + safe_diff * amount * punch * edge_mask;
+            final_luma = final_luma.clamp(0.0, 1.0);
+
+            let gain = final_luma / luma.max(0.001);
+            r = (r * gain).clamp(0.0, 1.0);
+            g = (g * gain).clamp(0.0, 1.0);
+            b = (b * gain).clamp(0.0, 1.0);
+        }
+
+        // ==========================================
+        // 🌄 STRUCTURE (broad local contrast)
+        // ==========================================
+        if params.n_structure.abs() > 1e-6 {
+            if let Some(wide) = &base.wide_blur {
+                let blurred = Self::sample_texture_base(wide, x, y, width, height);
+                let base_luma = 0.2126 * blurred[0] + 0.7152 * blurred[1] + 0.0722 * blurred[2];
+                let luma_now = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                let amount = if params.n_structure > 0.0 {
+                    params.n_structure * detail_mask
+                } else {
+                    params.n_structure
+                };
+                if luma_now > 0.001 {
+                    let final_luma = creative::apply_structure(luma_now, base_luma, amount);
+                    let gain = final_luma / luma_now;
+                    r = (r * gain).clamp(0.0, 1.0);
+                    g = (g * gain).clamp(0.0, 1.0);
+                    b = (b * gain).clamp(0.0, 1.0);
+                }
+            }
+        }
+
+        // ==========================================
+        // 📸 SHARPENING (Unsharp Mask)
+        // ==========================================
+        if let Some(blur) = &base.sharpen_blur {
+            let high_pass = luma - blur[idx];
+
+            let max_lighten = 0.20;
+            let max_darken = 0.12;
+
+            let limited_hp = if high_pass > 0.0 {
+                high_pass.min(max_lighten)
+            } else {
+                high_pass.max(-max_darken)
+            };
+
+            let strength = params.n_sharpen * 4.0;
+            let luma_delta = limited_hp * strength * detail_mask;
+
+            if luma > 0.001 {
+                let ratio = (luma + luma_delta) / luma;
+                r = (r * ratio).clamp(0.0, 1.0);
+                g = (g * ratio).clamp(0.0, 1.0);
+                b = (b * ratio).clamp(0.0, 1.0);
+            }
+        }
+
+        [r, g, b]
+    }
+
+    /// Effects tail of the spatial pass for one pixel: Glow / Halation / Flare /
+    /// Grain / Vignette, reading the detail head's display-referred f32 RGB.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn spatial_effects_pixel(
+        rgb: [f32; 3],
+        x: usize,
+        y: usize,
+        idx: usize,
+        grain_map: &[f32],
+        base: &SpatialBase,
+        params: &SpatialParams,
+        width: usize,
+        height: usize,
+    ) -> [f32; 3] {
+        let (mut r, mut g, mut b) = (rgb[0], rgb[1], rgb[2]);
+
+        // ✨ CREATIVE: GLOW / HALATION / LIGHT FLARES
+        if params.n_glow > 0.0 {
+            if let Some(wide) = &base.wide_blur {
+                let blurred = Self::sample_texture_base(wide, x, y, width, height);
+                let out = creative::apply_glow([r, g, b], blurred, params.n_glow);
+                r = out[0].clamp(0.0, 1.0);
+                g = out[1].clamp(0.0, 1.0);
+                b = out[2].clamp(0.0, 1.0);
+            }
+        }
+        if params.n_halation > 0.0 {
+            if let Some(hal) = &base.halation_blur {
+                let blurred = Self::sample_texture_base(hal, x, y, width, height);
+                let out = creative::apply_halation([r, g, b], blurred, params.n_halation);
+                r = out[0].clamp(0.0, 1.0);
+                g = out[1].clamp(0.0, 1.0);
+                b = out[2].clamp(0.0, 1.0);
+            }
+        }
+        if params.n_flare > 0.0 {
+            if let Some(fb) = &base.flare_base {
+                let f = fb.sample(x, y, width, height);
+                let out = flare::apply_flare([r, g, b], f, params.n_flare);
+                r = out[0].clamp(0.0, 1.0);
+                g = out[1].clamp(0.0, 1.0);
+                b = out[2].clamp(0.0, 1.0);
+            }
+        }
+
+        // 🎞 FILM GRAIN
+        if params.grain_amount > 0.0 {
+            if let Some(&gbase) = grain_map.get(idx * 2) {
+                let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                let noise = match grain_map.get(idx * 2 + 1) {
+                    Some(&rough) => crate::pipeline::grain::blend_noise(
+                        gbase,
+                        rough,
+                        params.grain_roughness / 100.0,
+                    ),
+                    None => gbase,
+                };
+                let delta = crate::pipeline::grain::grain_delta(
+                    noise,
+                    params.grain_amount / 100.0,
+                    luma,
+                );
+                r = (r + delta).clamp(0.0, 1.0);
+                g = (g + delta).clamp(0.0, 1.0);
+                b = (b + delta).clamp(0.0, 1.0);
+            }
+        }
+
+        // 🌑 VIGNETTE (positional, after grain)
+        if params.vignette_active {
+            let mut c = [r, g, b];
+            params.vignette.apply(&mut c, x, y, width, height);
+            r = c[0];
+            g = c[1];
+            b = c[2];
+        }
+
+        [r, g, b]
+    }
+
+    /// Detail head: runs [`TinyLumaApp::spatial_detail_pixel`] over the
+    /// whole frame and writes display-referred f32 RGB into `out`. Kept in f32 so
+    /// the effects tail is byte-identical to the monolithic pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spatial_detail_pass(
+        settings: &FilterSettings,
+        input: &[u8],
+        clarity_base: &[f32],
+        clarity_sw: usize,
+        clarity_sh: usize,
+        spatial_base: &SpatialBase,
+        width: usize,
+        height: usize,
+        out: &mut [f32],
+    ) {
+        let params = SpatialParams::new(settings);
+        out.par_chunks_mut(3).enumerate().for_each(|(idx, px)| {
+            let x = idx % width;
+            let y = idx / width;
+            let ci = idx * 3;
+            let d = Self::spatial_detail_pixel(
+                [
+                    input[ci] as f32 / 255.0,
+                    input[ci + 1] as f32 / 255.0,
+                    input[ci + 2] as f32 / 255.0,
+                ],
+                x,
+                y,
+                idx,
+                spatial_base,
+                &params,
+                clarity_base,
+                clarity_sw,
+                clarity_sh,
+                width,
+                height,
+            );
+            px[0] = d[0];
+            px[1] = d[1];
+            px[2] = d[2];
+        });
+    }
+
+    /// Effects tail: runs [`TinyLumaApp::spatial_effects_pixel`] over the
+    /// detail head and writes the final u8 RGB into `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spatial_effects_pass(
+        settings: &FilterSettings,
+        detail: &[f32],
+        grain_map: &[f32],
+        spatial_base: &SpatialBase,
+        width: usize,
+        height: usize,
+        out: &mut [u8],
+    ) {
+        let params = SpatialParams::new(settings);
+        out.par_chunks_mut(3).enumerate().for_each(|(idx, px)| {
+            let x = idx % width;
+            let y = idx / width;
+            let ci = idx * 3;
+            let e = Self::spatial_effects_pixel(
+                [detail[ci], detail[ci + 1], detail[ci + 2]],
+                x,
+                y,
+                idx,
+                grain_map,
+                spatial_base,
+                &params,
+                width,
+                height,
+            );
+            px[0] = (e[0] * 255.0).clamp(0.0, 255.0) as u8;
+            px[1] = (e[1] * 255.0).clamp(0.0, 255.0) as u8;
+            px[2] = (e[2] * 255.0).clamp(0.0, 255.0) as u8;
+        });
+    }
+
+    // ==========================================
+    // PHASE 3: REDUCED-RESOLUTION INTERACTIVE DRAG TIER
+    // ==========================================
+
+    /// Dimensions of the reduced drag buffer for a `width × height` preview
+    /// (long side capped at [`DRAG_WORK_MAX`], aspect ratio preserved).
+    pub(crate) fn drag_dims(width: usize, height: usize) -> (usize, usize) {
+        let m = width.max(height);
+        if m <= DRAG_WORK_MAX {
+            return (width, height);
+        }
+        let scale = DRAG_WORK_MAX as f32 / m as f32;
+        (
+            ((width as f32 * scale).round() as usize).max(1),
+            ((height as f32 * scale).round() as usize).max(1),
+        )
+    }
+
+    // ==========================================
+    // PHASE 4: DYNAMIC VIEWPORT PROXY
+    // ==========================================
+
+    /// Long-side target of the interactive proxy for a viewport.
+    ///
+    /// `viewport_px` is the viewport's long side in logical points; the on-screen
+    /// image spans roughly `viewport_px · zoom · pixels_per_point` physical pixels
+    /// when fitted, so that product sizes the proxy. The value is snapped up to
+    /// the next [`PROXY_LADDER`] rung (never below [`PROXY_WORK_MIN`]) so the
+    /// proxy is rebuilt at most once per rung. Not yet clamped to the source —
+    /// see [`Self::proxy_dims`].
+    pub(crate) fn proxy_target_long(viewport_px: f32, zoom: f32, ppp: f32) -> usize {
+        let desired = (viewport_px * zoom * ppp).ceil().max(0.0) as usize;
+        let desired = desired.max(PROXY_WORK_MIN);
+        PROXY_LADDER
+            .iter()
+            .copied()
+            .find(|&r| r >= desired)
+            .unwrap_or(*PROXY_LADDER.last().unwrap())
+    }
+
+    /// Dimensions of the interactive proxy for a source frame scaled so
+    /// its long side is `target_long`. Aspect ratio is preserved, the result is
+    /// never upscaled beyond the source, and both axes stay ≥ 1.
+    pub(crate) fn proxy_dims_for_long(
+        source_w: usize,
+        source_h: usize,
+        target_long: usize,
+    ) -> (usize, usize) {
+        let sw = source_w.max(1);
+        let sh = source_h.max(1);
+        let source_long = sw.max(sh);
+        if target_long >= source_long {
+            return (sw, sh);
+        }
+        let target = target_long.max(1);
+        let scale = target as f32 / source_long as f32;
+        (
+            ((sw as f32 * scale).round() as usize).max(1),
+            ((sh as f32 * scale).round() as usize).max(1),
+        )
+    }
+
+    /// Dimensions of the interactive working proxy for a source frame at
+    /// the given viewport / zoom / pixel density. Composes
+    /// [`Self::proxy_target_long`] with [`Self::proxy_dims_for_long`]; the proxy
+    /// never exceeds the source and never falls below 1 px on either axis.
+    pub(crate) fn proxy_dims(
+        source_w: usize,
+        source_h: usize,
+        viewport_px: f32,
+        zoom: f32,
+        ppp: f32,
+    ) -> (usize, usize) {
+        let source_long = source_w.max(source_h).max(1);
+        let target = Self::proxy_target_long(viewport_px, zoom, ppp).min(source_long);
+        Self::proxy_dims_for_long(source_w, source_h, target)
+    }
+
+    /// Re-keys the resolution-implicit pipeline caches after the working
+    /// proxy (`preview_base`) changed size. `new_color_len` is the new working
+    /// image length (`width * height * 3`): the cached colour buffer is re-fitted
+    /// to it, so it can no longer be observed at the previous resolution's length.
+    /// Only clears the validity flags, bumps the input revision and resets the
+    /// upload keys — it does NOT force a re-render, because the background worker
+    /// already produced the display pixels (see [`Self::apply_proxy_reply`]); the
+    /// next settings change at the new resolution rebuilds them.
+    ///
+    /// Defence in depth, not the load-bearing fix: [`Self::process_preview`]
+    /// re-fits the colour buffer at its copy site as well, because a new image or
+    /// a close changes the working resolution without going through this helper.
+    fn invalidate_resolution_caches(&mut self, new_color_len: usize) {
+        // A resolution swap must not leave a cached buffer sized for the previous
+        // resolution: `copy_from_slice` panics on a length mismatch, and
+        // `panic = "abort"` turns that into an instant process kill.
+        if self.color_buffer.len() != new_color_len {
+            self.color_buffer.resize(new_color_len, 0);
+        }
+        self.color_buffer_valid = false;
+        self.luma_cache_valid = false;
+        self.clarity_cache_valid = false;
+        self.spatial_base_valid = false;
+        self.dehaze_cache_valid = false;
+        self.drag_tier.tier_valid = false;
+        // The spatial input resolution changed — invalidate the drag-tier caches.
+        self.spatial_input_revision = self.spatial_input_revision.wrapping_add(1);
+        // Force a fresh texture upload at the new size (the upload key has no size).
+        self.upload_display_key = None;
+        self.upload_orig_key = None;
+    }
+
+    /// Derives the desired proxy resolution from the viewport
+    /// (`canvas_long · zoom · ppp`) and records when it changed, for the rebuild
+    /// debounce. No-op until a frame is open. Sizes against the higher-res source
+    /// once it has arrived, else against the current base (so the target is
+    /// defined and never exceeds what is available).
+    pub(crate) fn update_proxy_target(&mut self, ctx: &egui::Context, canvas_long: f32, ppp: f32) {
+        if self.preview_base.is_none() || self.retouch.active {
+            return;
+        }
+        let (sw, sh) = match self.proxy_source_dims() {
+            Some(d) => d,
+            None => match self.preview_base.as_ref() {
+                Some(b) => (b.width() as usize, b.height() as usize),
+                None => return,
+            },
+        };
+        if sw == 0 || sh == 0 {
+            return;
+        }
+        let dims = Self::proxy_dims(sw, sh, canvas_long, self.zoom_scale, ppp);
+        if dims != self.desired_proxy {
+            self.desired_proxy = dims;
+            self.proxy_change_time = Instant::now();
+            // Keep frames coming so the debounce fires even without further input.
+            ctx.request_repaint_after(PROXY_SETTLE);
+        }
+    }
+
+    /// Enqueues a background rebuild of the working proxy from the
+    /// higher-res source once the desired resolution has settled (or a rebuild was
+    /// explicitly requested). The previous proxy stays visible (stretched) while
+    /// the worker downscales, heals and renders; [`Self::poll_proxy_render`]
+    /// installs the reply. No-op when the desired resolution already matches.
+    fn maybe_rebuild_proxy(&mut self, ctx: &egui::Context) {
+        if self.preview_base.is_none() || self.retouch.active {
+            return;
+        }
+        if self.desired_proxy == self.proxy_dims && !self.proxy_rebuild_now {
+            return;
+        }
+        if self.desired_proxy.0 == 0 || self.desired_proxy.1 == 0 {
+            return;
+        }
+        // A job for this exact target is already in flight — coalesce.
+        if self.proxy_pending_target == Some(self.desired_proxy) {
+            return;
+        }
+        // Debounce: while a zoom/size gesture is still settling, keep showing the
+        // previous (stretched) proxy and wait.
+        if !self.proxy_rebuild_now {
+            let elapsed = self.proxy_change_time.elapsed();
+            if elapsed < PROXY_SETTLE {
+                ctx.request_repaint_after(PROXY_SETTLE - elapsed);
+                return;
+            }
+        }
+        // A higher-res source is required to derive a new resolution.
+        let Some(source) = self.proxy_source.clone() else {
+            self.proxy_rebuild_now = false;
+            return;
+        };
+        let (sw, sh) = (source.width() as usize, source.height() as usize);
+        // Never upscale past the source.
+        let (dw, dh) = self.desired_proxy;
+        let (dw, dh) = if dw > sw || dh > sh { (sw, sh) } else { (dw, dh) };
+        if dw == 0 || dh == 0 {
+            self.proxy_rebuild_now = false;
+            return;
+        }
+        self.proxy_job_revision = self.proxy_job_revision.wrapping_add(1);
+        let revision = self.proxy_job_revision;
+        let req = ProxyRequest {
+            revision,
+            source,
+            target: (dw, dh),
+            settings: self.settings,
+            lut: self.active_lut.clone(),
+            layer: Arc::new(self.retouch.layer.clone()),
+        };
+        self.proxy_pending_target = Some((dw, dh));
+        self.proxy_rebuild_now = false;
+        self.proxy_worker_mut(ctx).enqueue(req);
+        // Keep frames coming so the reply is applied promptly.
+        ctx.request_repaint();
+    }
+
+    /// Lazily spawns the background proxy-render worker.
+    fn proxy_worker_mut(&mut self, ctx: &egui::Context) -> &mut super::proxy_job::ProxyWorker {
+        if self.proxy_worker.is_none() {
+            self.proxy_worker = Some(super::proxy_job::ProxyWorker::spawn(ctx));
+        }
+        self.proxy_worker
+            .as_mut()
+            .expect("worker spawned just above")
+    }
+
+    /// Applies finished proxy-render jobs. Called once per frame on the
+    /// UI thread; never blocks. Stale replies are discarded by revision.
+    pub(crate) fn poll_proxy_render(&mut self, ctx: &egui::Context) {
+        if let Some(w) = &mut self.proxy_worker {
+            w.pump();
+        }
+        let mut replies = Vec::new();
+        if let Some(w) = &self.proxy_worker {
+            while let Ok(reply) = w.rx.try_recv() {
+                replies.push(reply);
+            }
+        }
+        for reply in replies {
+            self.apply_proxy_reply(reply, ctx);
+        }
+    }
+
+    /// Installs a worker-rendered proxy as the new working base and
+    /// shows its pixels, re-keying the resolution-implicit caches **without**
+    /// forcing a re-render (the worker already produced the display pixels).
+    fn apply_proxy_reply(&mut self, reply: ProxyReply, ctx: &egui::Context) {
+        match reply {
+            ProxyReply::Rendered {
+                revision,
+                proxy,
+                processed,
+                dims,
+            } => {
+                // Superseded (a newer target was requested) — discard.
+                if revision != self.proxy_job_revision {
+                    return;
+                }
+                // A retouch session owns the canvas; the proxy is not shown.
+                if self.retouch.active {
+                    self.proxy_pending_target = None;
+                    return;
+                }
+                self.proxy_pending_target = None;
+                self.preview_base = Some(proxy);
+                self.processed_pixels = processed;
+                self.proxy_dims = dims;
+                self.desired_proxy = dims;
+                self.proxy_rebuild_now = false;
+                // The base changed size: re-key the caches for the new resolution
+                // but do NOT mark the pipeline dirty (the worker already rendered).
+                self.invalidate_resolution_caches(self.processed_pixels.len());
+                self.processed_revision = self.processed_revision.wrapping_add(1);
+                self.upload_preview_textures(ctx);
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// Cancels any in-flight proxy-render job (frame switch, close,
+    /// retouch entry). The worker drops a superseded job before doing the work.
+    pub(crate) fn invalidate_proxy_render(&mut self) {
+        if let Some(w) = &mut self.proxy_worker {
+            w.invalidate();
+        }
+        self.proxy_job_revision = self.proxy_job_revision.wrapping_add(1);
+        self.proxy_pending_target = None;
+    }
+
+    /// Box-downscales an interleaved RGB8 buffer (area average per output pixel).
+    pub(crate) fn downscale_rgb(src: &[u8], w: usize, h: usize, dw: usize, dh: usize) -> Vec<u8> {
+        let mut out = vec![0u8; dw * dh * 3];
+        if dw == w && dh == h {
+            let n = out.len();
+            out.copy_from_slice(&src[..n]);
+            return out;
+        }
+        let sx = w as f32 / dw as f32;
+        let sy = h as f32 / dh as f32;
+        out.par_chunks_mut(3).enumerate().for_each(|(i, o)| {
+            let dx = i % dw;
+            let dy = i / dw;
+            let x0 = (dx as f32 * sx) as usize;
+            let x1 = (((dx + 1) as f32 * sx) as usize).clamp(x0 + 1, w);
+            let y0 = (dy as f32 * sy) as usize;
+            let y1 = (((dy + 1) as f32 * sy) as usize).clamp(y0 + 1, h);
+            let mut acc = [0.0f32; 3];
+            let mut cnt = 0.0f32;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let b = (y * w + x) * 3;
+                    acc[0] += src[b] as f32;
+                    acc[1] += src[b + 1] as f32;
+                    acc[2] += src[b + 2] as f32;
+                    cnt += 1.0;
+                }
+            }
+            let inv = 1.0 / cnt.max(1.0);
+            o[0] = (acc[0] * inv) as u8;
+            o[1] = (acc[1] * inv) as u8;
+            o[2] = (acc[2] * inv) as u8;
+        });
+        out
+    }
+
+    /// Signature of the settings that affect *construction* of the spatial bases
+    /// (which effects are engaged) plus the drag resolution.
+    fn drag_base_signature(s: &FilterSettings, dw: usize, dh: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        dw.hash(&mut h);
+        dh.hash(&mut h);
+        (s.texture != 0.0).hash(&mut h);
+        (s.sharpen > 0.0).hash(&mut h);
+        (!s.noise.is_identity()).hash(&mut h);
+        (s.detail_masking > 0.0).hash(&mut h);
+        (s.glow > 0.0).hash(&mut h);
+        (s.structure != 0.0).hash(&mut h);
+        (s.halation > 0.0).hash(&mut h);
+        (s.flare > 0.0).hash(&mut h);
+        h.finish()
+    }
+
+    /// Signature of the settings the detail head depends on.
+    fn drag_detail_signature(s: &FilterSettings) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for v in [
+            s.texture,
+            s.clarity,
+            s.structure,
+            s.sharpen,
+            s.detail_masking,
+            s.noise.luma,
+            s.noise.chroma,
+            s.noise.detail,
+        ] {
+            v.to_bits().hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Renders the spatial pass at the reduced drag resolution and
+    /// uploads the smaller texture. The cached input/bases and the f32 detail
+    /// head are reused when only effects changed, so dragging an effects slider
+    /// skips the detail work. Returns the drag dimensions actually used.
+    fn render_spatial_drag_tier(
+        &mut self,
+        ctx: &egui::Context,
+        width: usize,
+        height: usize,
+        use_dehaze: bool,
+    ) -> (usize, usize) {
+        let (dw, dh) = Self::drag_dims(width, height);
+        let settings = self.settings;
+
+        // Rebuild the downscaled input + precomputations only when the input
+        // revision, the resolution or the base-affecting settings changed.
+        let base_sig = Self::drag_base_signature(&settings, dw, dh);
+        let tier_rev = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.spatial_input_revision.hash(&mut h);
+            base_sig.hash(&mut h);
+            h.finish()
+        };
+
+        if !self.drag_tier.tier_valid || self.drag_tier.tier_rev != tier_rev {
+            let small = {
+                let src: &[u8] = if use_dehaze {
+                    &self.dehazed_buffer
+                } else {
+                    &self.color_buffer
+                };
+                Self::downscale_rgb(src, width, height, dw, dh)
+            };
+            let luma = Self::compute_luma_map(&small);
+            let (clarity, csw, csh) = if settings.clarity != 0.0 {
+                Self::compute_clarity_cache(&luma, dw, dh)
+            } else {
+                (Vec::new(), 0, 0)
+            };
+            let spatial_base = Self::compute_spatial_base(&settings, &small, &luma, dw, dh);
+
+            let tier = &mut self.drag_tier;
+            tier.input = small;
+            tier.clarity = clarity;
+            tier.clarity_sw = csw;
+            tier.clarity_sh = csh;
+            tier.spatial_base = spatial_base;
+            tier.detail_valid = false;
+            tier.tier_rev = tier_rev;
+            tier.tier_valid = true;
+        }
+
+        // Detail head: skipped entirely when only the effects changed.
+        let detail_sig = Self::drag_detail_signature(&settings);
+        if !self.drag_tier.detail_valid || self.drag_tier.detail_sig != detail_sig {
+            let n = dw * dh * 3;
+            if self.drag_tier.detail.len() != n {
+                self.drag_tier.detail.resize(n, 0.0);
+            }
+            Self::spatial_detail_pass(
+                &settings,
+                &self.drag_tier.input,
+                &self.drag_tier.clarity,
+                self.drag_tier.clarity_sw,
+                self.drag_tier.clarity_sh,
+                &self.drag_tier.spatial_base,
+                dw,
+                dh,
+                &mut self.drag_tier.detail,
+            );
+            self.drag_tier.detail_sig = detail_sig;
+            self.drag_tier.detail_valid = true;
+        }
+
+        // Grain map at the drag resolution.
+        let grain_key = (settings.grain_size.to_bits(), settings.grain_roughness > 0.0);
+        if !self.drag_tier.grain_valid
+            || self.drag_tier.grain_dims != (dw, dh)
+            || self.drag_tier.grain_key != grain_key
+        {
+            let g = if settings.grain != 0.0 {
+                Self::generate_grain_map(
+                    dw,
+                    dh,
+                    42,
+                    settings.grain_size,
+                    settings.grain_roughness > 0.0,
+                )
+            } else {
+                Vec::new()
+            };
+            self.drag_tier.grain = g;
+            self.drag_tier.grain_dims = (dw, dh);
+            self.drag_tier.grain_key = grain_key;
+            self.drag_tier.grain_valid = true;
+        }
+
+        // Effects tail: always runs (cheap) on top of the cached detail head.
+        let n = dw * dh * 3;
+        if self.drag_tier.output.len() != n {
+            self.drag_tier.output.resize(n, 0);
+        }
+        Self::spatial_effects_pass(
+            &settings,
+            &self.drag_tier.detail,
+            &self.drag_tier.grain,
+            &self.drag_tier.spatial_base,
+            dw,
+            dh,
+            &mut self.drag_tier.output,
+        );
+
+        // Upload the reduced texture (stretched to the same on-screen size — the
+        // canvas derives its scale from the viewport, not the texture size).
+        self.processed_revision = self.processed_revision.wrapping_add(1);
+        let overlay = self.clipping.overlay();
+        let data: &[u8] = if overlay.any() {
+            let mut buf = std::mem::take(&mut self.scratch_clip);
+            buf.clear();
+            buf.extend_from_slice(&self.drag_tier.output);
+            overlay.paint(&mut buf);
+            self.scratch_clip = buf;
+            &self.scratch_clip
+        } else {
+            &self.drag_tier.output
+        };
+        let img = egui::ColorImage::from_rgb([dw, dh], data);
+        if let Some(tex) = &mut self.texture {
+            tex.set(img, egui::TextureOptions::LINEAR);
+        } else {
+            self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR));
+        }
+        // Force a fresh full-resolution upload when the drag ends.
+        self.upload_display_key = None;
+        self.histogram = super::histogram::Histogram::of_rgb8(&self.drag_tier.output);
+        self.histogram_revision = self.processed_revision;
+        self.clip_overlay_applied = overlay;
+        (dw, dh)
+    }
+
+    // ==========================================
     // SAVING
 
     pub(crate) fn bake_temp_lut(
@@ -711,6 +1640,19 @@ impl TinyLumaApp {
     /// linearly.
     fn detail_scale(width: usize, height: usize) -> f32 {
         (width.max(height) as f32 / DETAIL_WORK_MAX as f32).max(1.0)
+    }
+
+    /// Sub-reference radius factor for the detail group.
+    ///
+    /// The detail kernels (the Texture/Clarity bilateral radius, the noise
+    /// radii, the mask radius, the Sharpen radius) are authored at the 1200 px
+    /// reference grid — see [`Self::detail_scale`], which downsamples the
+    /// working grid to ~1200 for inputs at or above the reference. On a proxy
+    /// *below* the reference (ladder rungs 640/960) that fixed radius is
+    /// relatively too large, so it is shrunk here by the same ratio; at or above
+    /// the reference this is exactly `1.0` and the behaviour is unchanged.
+    fn detail_radius_factor(width: usize, height: usize) -> f32 {
+        (width.max(height) as f32 / DETAIL_WORK_MAX as f32).min(1.0)
     }
 
     /// Downsample factor for Clarity taking resolution into account.
@@ -879,13 +1821,17 @@ impl TinyLumaApp {
                 rgb[2] = acc[2] / cnt;
             });
 
-        // Bilateral blur on the working grid (radius 2, as before).
-        let r = 2isize;
-        let mut weights = [0.0f32; 25];
+        // Bilateral blur on the working grid. The radius is authored at the
+        // 1200 px reference (2 px); on a sub-reference proxy it shrinks
+        // so the relative effect still matches the full render, and at or above
+        // the reference it stays 2 (unchanged).
+        let r = ((2.0 * Self::detail_radius_factor(w, h)).round() as isize).max(1);
+        let k = (2 * r + 1) as usize;
+        let mut weights = vec![0.0f32; k * k];
         for dy in -r..=r {
             for dx in -r..=r {
                 let dist_sq = (dx * dx + dy * dy) as f32;
-                weights[((dy + r) * 5 + (dx + r)) as usize] = (-dist_sq / 2.0).exp();
+                weights[((dy + r) as usize) * k + (dx + r) as usize] = (-dist_sq / 2.0).exp();
             }
         }
         let mut out = vec![0.0f32; sw * sh * 3];
@@ -902,7 +1848,7 @@ impl TinyLumaApp {
                     let ni = ny * sw + nx;
                     let diff = (l_c - small_luma[ni]).abs();
                     let range_w = 1.0 / (1.0 + diff * diff * 40.0);
-                    let wgt = weights[((dy + r) * 5 + (dx + r)) as usize] * range_w;
+                    let wgt = weights[((dy + r) as usize) * k + (dx + r) as usize] * range_w;
                     acc[0] += small_rgb[ni * 3] * wgt;
                     acc[1] += small_rgb[ni * 3 + 1] * wgt;
                     acc[2] += small_rgb[ni * 3 + 2] * wgt;
@@ -1025,14 +1971,20 @@ impl TinyLumaApp {
                 lab[1] = oklab[2];
             });
 
+        // Radii authored at the 1200 px reference; shrunk on a sub-reference
+        // proxy so the relative effect matches the full render.
+        let radius_factor = Self::detail_radius_factor(w, h);
+        let chroma_radius = (noise::CHROMA_RADIUS * radius_factor).max(1.0);
+        let luma_radius = (noise::LUMA_RADIUS * radius_factor).max(1.0);
+
         // Wide chroma low-pass (a and b separately).
         let a_plane: Vec<f32> = small_lab.par_chunks(3).map(|p| p[0]).collect();
         let b_plane: Vec<f32> = small_lab.par_chunks(3).map(|p| p[1]).collect();
-        let a_plane = Self::gaussian_blur_map(&a_plane, sw, sh, noise::CHROMA_RADIUS);
-        let b_plane = Self::gaussian_blur_map(&b_plane, sw, sh, noise::CHROMA_RADIUS);
+        let a_plane = Self::gaussian_blur_map(&a_plane, sw, sh, chroma_radius);
+        let b_plane = Self::gaussian_blur_map(&b_plane, sw, sh, chroma_radius);
 
         // Edge-aware log2-luminance guide (self-guided filter).
-        let guide = Self::guided_log_luma(&small_luma, sw, sh, noise::LUMA_RADIUS, noise::LUMA_EPS);
+        let guide = Self::guided_log_luma(&small_luma, sw, sh, luma_radius, noise::LUMA_EPS);
 
         let mut data = vec![0.0f32; sw * sh * 3];
         data.par_chunks_mut(3).enumerate().for_each(|(i, o)| {
@@ -1123,8 +2075,10 @@ impl TinyLumaApp {
             *out = acc / cnt;
         });
 
-        // Local high-pass energy, then a soft gate.
-        let blur = Self::gaussian_blur_map(&small, sw, sh, MASK_RADIUS);
+        // Local high-pass energy, then a soft gate. The radius is authored at
+        // the 1200 px reference; shrunk on a sub-reference proxy.
+        let mask_radius = (MASK_RADIUS * Self::detail_radius_factor(w, h)).max(1.0);
+        let blur = Self::gaussian_blur_map(&small, sw, sh, mask_radius);
         let hp2: Vec<f32> = small
             .par_iter()
             .zip(blur.par_iter())
@@ -1133,7 +2087,7 @@ impl TinyLumaApp {
                 hp * hp
             })
             .collect();
-        let energy = Self::gaussian_blur_map(&hp2, sw, sh, MASK_RADIUS);
+        let energy = Self::gaussian_blur_map(&hp2, sw, sh, mask_radius);
         let data: Vec<f32> = energy.par_iter().map(|en| en / (en + MASK_KNEE2)).collect();
 
         MaskBase { data, sw, sh }
@@ -1204,9 +2158,10 @@ impl TinyLumaApp {
             }
         }
 
-        // 2. Bilateral blur small_luma → clarity_cache
+        // 2. Bilateral blur small_luma → clarity_cache. Radius authored at the
+        // 1200 px reference, shrunk on a sub-reference proxy.
         let mut clarity_cache = vec![0.0f32; sw * sh];
-        let r = 2isize;
+        let r = ((2.0 * Self::detail_radius_factor(w, h)).round() as isize).max(1);
         clarity_cache
             .par_iter_mut()
             .enumerate()
@@ -1237,19 +2192,16 @@ impl TinyLumaApp {
         (clarity_cache, sw, sh)
     }
 
-    /// Full offline render of an arbitrary image: the color pass
-    /// (sliders + external LUT) + the spatial pass (Texture, Clarity,
-    /// Sharpening, Grain). Used by export so that a single save
-    /// and batch processing produce the SAME result at full resolution.
+    /// Full offline render of an arbitrary image: the retouch layer, the color
+    /// pass (sliders + external LUT) and the spatial pass (Texture, Clarity,
+    /// Sharpening, Grain). Used by export so that a single save and batch
+    /// processing produce the SAME result at full resolution.
     pub(crate) fn render_full_image(
         img: &RgbImage,
         settings: &FilterSettings,
         lut_path: &Option<PathBuf>,
         layer: &RetouchLayer,
     ) -> Vec<u8> {
-        let w = img.width() as usize;
-        let h = img.height() as usize;
-
         // ---- Retouch (heal) runs BEFORE everything else, on the raw base ----
         let layered;
         let src = if layer.is_empty() {
@@ -1260,10 +2212,48 @@ impl TinyLumaApp {
             layered = healed;
             &layered
         };
-        let mut color_buffer = src.as_raw().clone();
+        // Export always bakes the 64³ LUT (`bake_temp_lut` returns `Some`).
+        let lut = Self::bake_temp_lut(settings, lut_path);
+        Self::render_base_through_lut(src, settings, lut.as_ref())
+    }
 
-        // ---- Pass 1: color (through the baked LUT) ----
-        if let Some(lut) = Self::bake_temp_lut(settings, lut_path) {
+    /// Pure preview render of one already-healed base at its working
+    /// resolution. Reproduces the interactive preview's cold, non-drag path — the
+    /// color pass through the always-[`PREVIEW_LUT_SIZE`]³ preview LUT (with the
+    /// same identity fast path as [`Self::process_preview`]), full-quality dehaze,
+    /// then the spatial chain — so the background proxy worker and the UI produce
+    /// byte-identical pixels. Never uses the export 64³ LUT.
+    pub(crate) fn render_preview_at(
+        base: &RgbImage,
+        settings: &FilterSettings,
+        active_lut: Option<&Lut3D>,
+    ) -> Vec<u8> {
+        // Default sliders + no external LUT = an identity pass; the UI skips the
+        // bake entirely there, so the proxy render must too (parity).
+        let lut = if *settings == FilterSettings::default() && active_lut.is_none() {
+            None
+        } else {
+            Some(Self::bake_lut(settings, active_lut, PREVIEW_LUT_SIZE))
+        };
+        Self::render_base_through_lut(base, settings, lut.as_ref())
+    }
+
+    /// Passes 1-3 shared by [`Self::render_full_image`] and
+    /// [`Self::render_preview_at`]: color through the supplied LUT (or an identity
+    /// copy when `lut` is `None`), dehaze, then the spatial chain. One
+    /// implementation is what keeps the export path, the UI preview and the
+    /// background proxy render from diverging.
+    pub(crate) fn render_base_through_lut(
+        img: &RgbImage,
+        settings: &FilterSettings,
+        lut: Option<&Lut3D>,
+    ) -> Vec<u8> {
+        let w = img.width() as usize;
+        let h = img.height() as usize;
+        let mut color_buffer = img.as_raw().clone();
+
+        // ---- Pass 1: color (through the supplied LUT) ----
+        if let Some(lut) = lut {
             color_buffer.par_chunks_mut(3).for_each(|pixel| {
                 let r = pixel[0] as f32 / 255.0;
                 let g = pixel[1] as f32 / 255.0;
@@ -1335,6 +2325,9 @@ impl TinyLumaApp {
     }
 
     pub(crate) fn process_preview(&mut self, ctx: &egui::Context) {
+        // Rebuild the working proxy first (debounced); it may mark the
+        // pipeline dirty at the new resolution.
+        self.maybe_rebuild_proxy(ctx);
         let needs_reprocess = self.color_dirty || self.spatial_dirty || self.retouch_dirty;
         if !needs_reprocess && !self.full_render_pending {
             return;
@@ -1372,13 +2365,13 @@ impl TinyLumaApp {
         // so real pixel detail is visible. The layer is still non-destructive;
         // the full-resolution buffers live only while the tool is active.
         if self.retouch.active {
+            // Decode + whole-layer rebuild run on the background heal
+            // worker; here we only enqueue (if needed) and upload whatever is
+            // ready, so this branch returns immediately.
             let path = self.image_path.clone();
-            self.retouch.ensure_full_base(path.as_deref());
-            self.retouch.ensure_full_healed();
-            if self.retouch.full_texture_dirty {
-                self.upload_full_retouch_textures(ctx);
-                self.retouch.full_texture_dirty = false;
-            }
+            self.request_full_base(ctx, path.as_deref());
+            self.ensure_full_rebuild(ctx);
+            self.upload_full_retouch_textures(ctx);
             self.color_dirty = false;
             self.spatial_dirty = false;
             self.color_buffer_valid = false;
@@ -1410,17 +2403,28 @@ impl TinyLumaApp {
         // `!color_buffer_valid` — the ready render was taken from the cache, but the color_buffer
         // for subsequent spatial edits is not yet assembled.
         if self.color_dirty || !self.color_buffer_valid {
+            // The working resolution can change at runtime when the viewport proxy is
+            // swapped, so `color_buffer` may still be sized for the previous
+            // resolution: re-fit it before the copy. `resize` is a no-op when the
+            // length already matches, so the common path is unchanged.
+            if self.color_buffer.len() != base_raw.len() {
+                self.color_buffer.resize(base_raw.len(), 0);
+            }
+            debug_assert_eq!(
+                self.color_buffer.len(),
+                base_raw.len(),
+                "colour buffer must match the working resolution before the copy"
+            );
             // Fast path: default sliders + no LUT = an identity pass.
             // We do not bake an identity LUT — that is a noticeable saving on every frame.
             if self.settings == FilterSettings::default() && self.active_lut.is_none() {
                 self.color_buffer.copy_from_slice(&base_raw);
                 self.combined_lut = None;
             } else {
-                // The preview is always baked at 33³: versus 64³ the mean error is ~1/255 for
-                // both, and 64³ only wins in the worst case of clipping —
-                // while costing ~18 ms on release. The export stays at 64³
-                // (`bake_temp_lut`), so files do not lose quality.
-                const PREVIEW_LUT_SIZE: usize = 33;
+                // The preview is always baked at `PREVIEW_LUT_SIZE` (33³): versus
+                // 64³ the mean error is ~1/255 for both, and 64³ only wins in the
+                // worst case of clipping — while costing ~18 ms on release. The
+                // export stays at 64³ (`bake_temp_lut`), so files do not lose quality.
                 self.combined_lut = self.bake_combined_lut(PREVIEW_LUT_SIZE);
 
                 // Apply the LUT to all pixels (trilinear interpolation)
@@ -1451,6 +2455,8 @@ impl TinyLumaApp {
             self.clarity_cache_valid = false;
             self.dehaze_cache_valid = false;
             self.spatial_base_valid = false;
+            // The spatial input changed — invalidate the drag tier.
+            self.spatial_input_revision = self.spatial_input_revision.wrapping_add(1);
         }
 
         let has_dehaze = self.settings.dehaze != 0.0;
@@ -1489,6 +2495,8 @@ impl TinyLumaApp {
             self.dehaze_cache_valid = true;
             self.dehaze_applied = self.settings.dehaze;
             self.dehaze_cached_fast = dehaze_fast;
+            // The spatial input changed — invalidate the drag tier.
+            self.spatial_input_revision = self.spatial_input_revision.wrapping_add(1);
             // The spatial input changed, but during drag the Details precomputations
             // (luma/clarity/texture/sharpen) are NOT recomputed — they catch up
             // on release (where `color_dirty` already resets the caches). The spatial
@@ -1505,6 +2513,8 @@ impl TinyLumaApp {
             self.luma_cache_valid = false;
             self.clarity_cache_valid = false;
             self.spatial_base_valid = false;
+            // The spatial input changed — invalidate the drag tier.
+            self.spatial_input_revision = self.spatial_input_revision.wrapping_add(1);
         }
 
         // ---- Recompute luma_cache (only when the spatial input changed) ----
@@ -1568,42 +2578,61 @@ impl TinyLumaApp {
         }
 
         // Keep the grain map in sync with the Grain Size slider before the
-        // spatial pass below borrows it.
-        if self.settings.grain != 0.0 {
+        // spatial pass below borrows it. Skipped while the reduced-resolution
+        // drag tier is active — it maintains its own grain map at the drag
+        // resolution, so regenerating the full-resolution one every drag frame
+        // (the dominant cost of a Grain Size drag) would be wasted.
+        let drag_tier_active = self.spatial_dirty && needs_spatial && self.drag_active;
+        if self.settings.grain != 0.0 && !drag_tier_active {
             self.ensure_grain_map(w, h);
         }
 
         // ---- Pass: Spatial effects ----
+        //
+        // While a slider is being dragged and the spatial pass actually
+        // needs to run, use the reduced-resolution drag tier (the staged pipeline
+        // on a downscaled input) instead of the full-resolution pass. The
+        // authoritative full-resolution render runs on release via
+        // `full_render_pending`.
+        let mut drag_uploaded = false;
         if self.spatial_dirty {
-            let input: &[u8] = if has_dehaze_active {
-                &self.dehazed_buffer
+            if needs_spatial && self.drag_active {
+                self.render_spatial_drag_tier(ctx, w, h, has_dehaze_active);
+                drag_uploaded = true;
             } else {
-                &self.color_buffer
-            };
-            if needs_spatial {
-                Self::run_spatial_pass_with_base(
-                    &self.settings,
-                    input,
-                    &mut self.processed_pixels,
-                    &self.grain_map,
-                    &self.clarity_cache,
-                    self.clarity_cache_sw,
-                    self.clarity_cache_sh,
-                    &self.spatial_base,
-                    w,
-                    h,
-                );
-            } else {
-                if self.processed_pixels.len() != input.len() {
-                    self.processed_pixels.resize(input.len(), 0);
+                let input: &[u8] = if has_dehaze_active {
+                    &self.dehazed_buffer
+                } else {
+                    &self.color_buffer
+                };
+                if needs_spatial {
+                    Self::run_spatial_pass_with_base(
+                        &self.settings,
+                        input,
+                        &mut self.processed_pixels,
+                        &self.grain_map,
+                        &self.clarity_cache,
+                        self.clarity_cache_sw,
+                        self.clarity_cache_sh,
+                        &self.spatial_base,
+                        w,
+                        h,
+                    );
+                } else {
+                    if self.processed_pixels.len() != input.len() {
+                        self.processed_pixels.resize(input.len(), 0);
+                    }
+                    self.processed_pixels.copy_from_slice(input);
                 }
-                self.processed_pixels.copy_from_slice(input);
             }
             self.spatial_dirty = false;
         }
 
-        // GPU upload
-        self.upload_preview_textures(ctx);
+        if !drag_uploaded {
+            // GPU upload (full-resolution preview)
+            self.processed_revision = self.processed_revision.wrapping_add(1);
+            self.upload_preview_textures(ctx);
+        }
 
         // Store the ready render in the cache (final only, not during drag).
         // The identity pass (default + no LUT) is not cached: the result equals base,
@@ -1616,14 +2645,22 @@ impl TinyLumaApp {
                     &path,
                     self.settings,
                     self.lut_path.clone(),
+                    (w, h),
                     self.processed_pixels.clone(),
                 );
             }
         }
+
     }
 
     /// Uploads `processed_pixels` and the base frame into GPU textures, applies
     /// the clipping warning overlay, and refreshes the output histogram.
+    ///
+    /// Upload only what changed — the display texture is re-uploaded only
+    /// when the processed pixels or the warning overlay changed, the original
+    /// (before) texture only when the source image changes, and the histogram only
+    /// when the rendered pixels change. The clipping overlay paints into a reused
+    /// scratch buffer instead of cloning.
     pub(crate) fn upload_preview_textures(&mut self, ctx: &egui::Context) {
         let (w, h) = match self.preview_base.as_ref() {
             Some(b) => (b.width() as usize, b.height() as usize),
@@ -1637,45 +2674,72 @@ impl TinyLumaApp {
         // Clipping warnings replace the shown pixels with the warning colours.
         // They are a view aid, not an edit, so `processed_pixels` is untouched.
         let overlay = self.clipping.overlay();
-        let mut clipped: Vec<u8>;
-        let proc: &[u8] = if overlay.any() {
-            clipped = if has_render {
-                self.processed_pixels.clone()
+
+        // --- Display texture: only when the shown pixels or the overlay changed.
+        let display_key = (self.processed_revision, w as u32, h as u32, overlay);
+        let display_changed =
+            self.texture.is_none() || self.upload_display_key != Some(display_key);
+        if display_changed {
+            let proc: &[u8] = if overlay.any() {
+                // Reuse the scratch buffer (no per-frame clone/to_vec).
+                let src: &[u8] = if has_render {
+                    &self.processed_pixels
+                } else {
+                    self.preview_base.as_ref().unwrap().as_raw()
+                };
+                let mut buf = std::mem::take(&mut self.scratch_clip);
+                buf.clear();
+                buf.extend_from_slice(src);
+                overlay.paint(&mut buf);
+                self.scratch_clip = buf;
+                &self.scratch_clip
+            } else if has_render {
+                &self.processed_pixels
             } else {
-                self.preview_base.as_ref().unwrap().as_raw().to_vec()
+                self.preview_base.as_ref().unwrap().as_raw()
             };
-            overlay.paint(&mut clipped);
-            &clipped
-        } else if has_render {
-            &self.processed_pixels
-        } else {
-            self.preview_base.as_ref().unwrap().as_raw()
-        };
-        let color_image = egui::ColorImage::from_rgb([w, h], proc);
-        if let Some(tex) = &mut self.texture {
-            tex.set(color_image, egui::TextureOptions::LINEAR);
-        } else {
-            self.texture =
-                Some(ctx.load_texture("preview", color_image, egui::TextureOptions::LINEAR));
+            let color_image = egui::ColorImage::from_rgb([w, h], proc);
+            if let Some(tex) = &mut self.texture {
+                tex.set(color_image, egui::TextureOptions::LINEAR);
+            } else {
+                self.texture =
+                    Some(ctx.load_texture("preview", color_image, egui::TextureOptions::LINEAR));
+            }
+            self.upload_display_key = Some(display_key);
         }
 
-        // The histogram is of the rendered output, never of the warning overlay.
-        self.histogram = if has_render {
-            super::histogram::Histogram::of_rgb8(&self.processed_pixels)
-        } else {
-            super::histogram::Histogram::of_rgb8(self.preview_base.as_ref().unwrap().as_raw())
-        };
+        // --- Output histogram: only when the rendered pixels changed (not on an
+        // overlay-only re-upload).
+        if self.histogram_revision != self.processed_revision {
+            self.histogram = if has_render {
+                super::histogram::Histogram::of_rgb8(&self.processed_pixels)
+            } else {
+                super::histogram::Histogram::of_rgb8(self.preview_base.as_ref().unwrap().as_raw())
+            };
+            self.histogram_revision = self.processed_revision;
+        }
         self.clip_overlay_applied = overlay;
 
-        let orig_image = {
-            let base = self.preview_base.as_ref().unwrap();
-            egui::ColorImage::from_rgb([w, h], base.as_raw())
-        };
-        if let Some(tex) = &mut self.original_texture {
-            tex.set(orig_image, egui::TextureOptions::LINEAR);
-        } else {
-            self.original_texture =
-                Some(ctx.load_texture("original", orig_image, egui::TextureOptions::LINEAR));
+        // --- Original (before) texture: the base frame is unchanged across most
+        // preview frames; upload only when the source image changes.
+        let orig_key = self.image_path.clone().map(|p| (p, w as u32, h as u32));
+        let orig_changed = self.original_texture.is_none()
+            || match (&orig_key, &self.upload_orig_key) {
+                (Some(k), Some(prev)) => k != prev,
+                _ => true,
+            };
+        if orig_changed {
+            let orig_image = {
+                let base = self.preview_base.as_ref().unwrap();
+                egui::ColorImage::from_rgb([w, h], base.as_raw())
+            };
+            if let Some(tex) = &mut self.original_texture {
+                tex.set(orig_image, egui::TextureOptions::LINEAR);
+            } else {
+                self.original_texture =
+                    Some(ctx.load_texture("original", orig_image, egui::TextureOptions::LINEAR));
+            }
+            self.upload_orig_key = orig_key;
         }
     }
 }
@@ -1685,6 +2749,88 @@ impl TinyLumaApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deterministic RGB frame, distinct per pixel, so a length or content
+    /// mismatch between resolutions cannot pass silently.
+    fn synth_rgb(w: u32, h: u32) -> RgbImage {
+        RgbImage::from_fn(w, h, |x, y| {
+            let v = ((x * 7 + y * 3) % 256) as u8;
+            image::Rgb([v, 255 - v, v / 2 + 30])
+        })
+    }
+
+    /// A mid-session working-resolution change must not desync the cached colour
+    /// buffer. The viewport proxy swaps `preview_base` to a new resolution while
+    /// `color_buffer` still holds the old one; the colour pass then copies the new
+    /// base into it. Before the fix that copy panicked (`copy_from_slice` length
+    /// mismatch — `panic = "abort"` in release, so an instant process kill). This
+    /// drives the real stateful `process_preview` across two resolutions, the shape
+    /// the `Harness` in `perf.rs` cannot reach, and pins the stateful result to the
+    /// pure `render_preview_at` output at both sizes.
+    #[test]
+    fn resolution_swap_refits_the_colour_buffer() {
+        let ctx = egui::Context::default();
+        let mut app = TinyLumaApp::new_headless();
+        // Colour-only settings: the colour-copy guard is the code under test, and a
+        // non-default LUT keeps the identity fast path out of the way.
+        app.settings.exposure = 20.0;
+        app.settings.contrast = 15.0;
+        app.settings.temp = 12.0;
+        assert_ne!(app.settings, FilterSettings::default());
+
+        let base_a = synth_rgb(64, 48);
+
+        // Mirror the load path in image_io: both resolution-keyed buffers start
+        // sized to the loaded frame, so the first render is clean and any failure
+        // below is the swap itself, not the initial sizing.
+        app.color_buffer = base_a.as_raw().to_vec();
+        app.processed_pixels = base_a.as_raw().to_vec();
+
+        // First render at resolution A.
+        app.preview_base = Some(base_a.clone());
+        app.proxy_dims = (64, 48);
+        app.desired_proxy = (64, 48);
+        app.color_dirty = true;
+        app.spatial_dirty = true;
+        app.process_preview(&ctx);
+
+        let expect_a =
+            TinyLumaApp::render_preview_at(&base_a, &app.settings, app.active_lut.as_deref());
+        assert_eq!(
+            app.color_buffer.len(),
+            64 * 48 * 3,
+            "colour buffer sized to A"
+        );
+        assert_eq!(
+            app.processed_pixels, expect_a,
+            "stateful render != pure render at A"
+        );
+
+        // Swap the working proxy to a different resolution, exactly as
+        // `apply_proxy_reply` does when a worker reply lands.
+        let base_b = synth_rgb(37, 29);
+        app.preview_base = Some(base_b.clone());
+        app.proxy_dims = (37, 29);
+        app.desired_proxy = (37, 29);
+        app.invalidate_resolution_caches(base_b.as_raw().len());
+        app.color_dirty = true;
+        app.spatial_dirty = true;
+
+        // Must not panic on the colour-buffer copy, and must re-fit both buffers.
+        app.process_preview(&ctx);
+
+        let expect_b =
+            TinyLumaApp::render_preview_at(&base_b, &app.settings, app.active_lut.as_deref());
+        assert_eq!(
+            app.color_buffer.len(),
+            base_b.as_raw().len(),
+            "colour buffer re-fitted to B"
+        );
+        assert_eq!(
+            app.processed_pixels, expect_b,
+            "stateful render != pure render at B"
+        );
+    }
 
     #[test]
     fn default_settings_roundtrip() {
@@ -1835,10 +2981,16 @@ mod tests {
     }
 
     #[test]
-    fn detail_scale_is_one_for_preview_sizes() {
+    fn detail_scale_and_radius_factor_track_reference() {
+        // Downsample factor stays >= 1: it never upsamples the working grid.
         assert!((TinyLumaApp::detail_scale(1200, 800) - 1.0).abs() < 1e-6);
         assert!((TinyLumaApp::detail_scale(800, 600) - 1.0).abs() < 1e-6);
         assert!((TinyLumaApp::detail_scale(6000, 4000) - 5.0).abs() < 1e-6);
+        // Radius factor caps at 1.0 (reference and above) and shrinks below the
+        // reference so a sub-1200 proxy keeps the same relative effect.
+        assert!((TinyLumaApp::detail_radius_factor(1200, 800) - 1.0).abs() < 1e-6);
+        assert!((TinyLumaApp::detail_radius_factor(6000, 4000) - 1.0).abs() < 1e-6);
+        assert!((TinyLumaApp::detail_radius_factor(600, 400) - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -2307,5 +3459,332 @@ mod tests {
         // The hole center must differ.
         let center = (48 * 96 + 48) * 3;
         assert_ne!(&without[center..center + 3], &with[center..center + 3]);
+    }
+
+    /// The staged detail + effects passes are byte-identical to the
+    /// monolithic `run_spatial_pass_with_base`. Every effect is engaged so the
+    /// f32 detail head / effects tail split is exercised end to end.
+    #[test]
+    fn spatial_stages_match_monolithic() {
+        let (w, h) = (96usize, 72usize);
+        // Gradient + a blown highlight so Glow / Halation / Flare find energy.
+        let mut color = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                let v = (x as f32 / w as f32 * 200.0) as u8;
+                color[i] = v;
+                color[i + 1] = (v as f32 * 0.8) as u8;
+                color[i + 2] = 128;
+            }
+        }
+        for y in 30..40 {
+            for x in 40..52 {
+                let i = (y * w + x) * 3;
+                color[i] = 255;
+                color[i + 1] = 255;
+                color[i + 2] = 255;
+            }
+        }
+
+        // All sliders engaged (worst case) — texture/clarity/structure/sharpen,
+        // noise reduction, the creative group, grain and vignette.
+        let mut s = FilterSettings::default();
+        s.texture = 40.0;
+        s.clarity = 30.0;
+        s.structure = 35.0;
+        s.sharpen = 45.0;
+        s.detail_masking = 50.0;
+        s.noise.luma = 30.0;
+        s.noise.chroma = 20.0;
+        s.glow = 30.0;
+        s.halation = 25.0;
+        s.flare = 20.0;
+        s.grain = 30.0;
+        s.grain_roughness = 40.0;
+        s.vignette.amount = -40.0;
+
+        let luma = TinyLumaApp::compute_luma_map(&color);
+        let (clarity, csw, csh) = TinyLumaApp::compute_clarity_cache(&luma, w, h);
+        let grain = TinyLumaApp::generate_grain_map(w, h, 42, s.grain_size, true);
+        let base = TinyLumaApp::compute_spatial_base(&s, &color, &luma, w, h);
+
+        let mut mono = vec![0u8; color.len()];
+        TinyLumaApp::run_spatial_pass_with_base(
+            &s, &color, &mut mono, &grain, &clarity, csw, csh, &base, w, h,
+        );
+
+        let mut detail = vec![0.0f32; w * h * 3];
+        TinyLumaApp::spatial_detail_pass(
+            &s, &color, &clarity, csw, csh, &base, w, h, &mut detail,
+        );
+        let mut staged = vec![0u8; color.len()];
+        TinyLumaApp::spatial_effects_pass(&s, &detail, &grain, &base, w, h, &mut staged);
+
+        assert_eq!(
+            mono, staged,
+            "staged spatial passes diverged from the monolithic pass"
+        );
+    }
+
+    /// The detail group's *working grids* are pinned to the 1200 px
+    /// reference. At or above the reference the downsample lands on exactly 1200;
+    /// below it the grid is the (smaller) proxy — where `detail_radius_factor`
+    /// shrinks the fixed radii so the relative effect still matches. This is the
+    /// invariant `ARCHITECTURE.md` calls out; without it a 640/960 proxy would
+    /// over-strengthen Texture/Clarity/Sharpen versus the full render.
+    #[test]
+    fn detail_base_grid_is_reference_invariant() {
+        let (src_w, src_h) = (2400usize, 1600usize);
+        let mut color = vec![0u8; src_w * src_h * 3];
+        for y in 0..src_h {
+            for x in 0..src_w {
+                let i = (y * src_w + x) * 3;
+                let c = if ((x / 4) + (y / 4)) % 2 == 0 { 220u8 } else { 40u8 };
+                let g = (x as f32 / src_w as f32 * 60.0) as u8;
+                let v = c.saturating_add(g);
+                color[i] = v;
+                color[i + 1] = v;
+                color[i + 2] = v;
+            }
+        }
+        let mut s = FilterSettings::default();
+        s.texture = 40.0;
+        s.sharpen = 40.0;
+        s.detail_masking = 40.0;
+
+        for &bucket in &[640usize, 960, 1200, 1920] {
+            let (w, h) = TinyLumaApp::proxy_dims_for_long(src_w, src_h, bucket);
+            let small = TinyLumaApp::downscale_rgb(&color, src_w, src_h, w, h);
+            let luma = TinyLumaApp::compute_luma_map(&small);
+            let base = TinyLumaApp::compute_spatial_base(&s, &small, &luma, w, h);
+            let tex = base.texture_base.as_ref().expect("texture base present");
+            assert_eq!(
+                tex.sw.max(tex.sh),
+                bucket.min(1200),
+                "detail grid not reference-normalized for bucket {bucket}"
+            );
+            if let Some(m) = &base.mask_base {
+                assert_eq!(
+                    m.sw.max(m.sh),
+                    bucket.min(1200),
+                    "mask grid not reference-normalized for bucket {bucket}"
+                );
+            }
+        }
+    }
+
+    /// The relative Texture+Sharpen boost stays close across proxy
+    /// buckets around the 1200 px reference — the end-to-end guard for the radius
+    /// normalization (an un-normalized sub-reference proxy boosts much more).
+    #[test]
+    fn spatial_effect_is_close_across_proxy_buckets() {
+        let (src_w, src_h) = (1200usize, 800usize);
+        let mut color = vec![0u8; src_w * src_h * 3];
+        for y in 0..src_h {
+            for x in 0..src_w {
+                let i = (y * src_w + x) * 3;
+                let c = if ((x / 3) + (y / 3)) % 2 == 0 { 200u8 } else { 60u8 };
+                let g = (y as f32 / src_h as f32 * 50.0) as u8;
+                let v = c.saturating_add(g);
+                color[i] = v;
+                color[i + 1] = v;
+                color[i + 2] = v;
+            }
+        }
+        let mut s = FilterSettings::default();
+        s.texture = 60.0;
+        s.sharpen = 60.0;
+
+        // Mean horizontal luma gradient — a proxy for fine-detail energy.
+        let gradient = |rgb: &[u8], w: usize, h: usize| -> f64 {
+            let luma = TinyLumaApp::compute_luma_map(rgb);
+            let mut sum = 0.0f64;
+            for y in 0..h {
+                for x in 0..w.saturating_sub(1) {
+                    sum += (luma[y * w + x + 1] - luma[y * w + x]).abs() as f64;
+                }
+            }
+            sum / (w * h) as f64
+        };
+
+        let mut ratios = Vec::new();
+        for &bucket in &[640usize, 960, 1200] {
+            let (w, h) = TinyLumaApp::proxy_dims_for_long(src_w, src_h, bucket);
+            let small = TinyLumaApp::downscale_rgb(&color, src_w, src_h, w, h);
+            let luma = TinyLumaApp::compute_luma_map(&small);
+            let mut out = vec![0u8; small.len()];
+            TinyLumaApp::run_spatial_pass(
+                &s, &small, &mut out, &[], &luma, &[], 0, 0, w, h,
+            );
+            ratios.push(gradient(&out, w, h) / gradient(&small, w, h).max(1e-9));
+        }
+        let ref_ratio = ratios[2]; // bucket 1200
+        for (i, r) in ratios.iter().enumerate() {
+            assert!(
+                *r / ref_ratio > 0.6 && *r / ref_ratio < 1.6,
+                "relative detail boost drifted across proxy buckets: {ratios:?} (idx {i})"
+            );
+        }
+    }
+
+    /// The export path (`render_full_image`) is independent of the
+    /// interactive proxy — it renders at the full source resolution, never capped
+    /// to a proxy bucket. Guards against a future proxy leaking into export.
+    #[test]
+    fn export_renders_at_full_resolution_not_the_proxy() {
+        let (w, h) = (1500usize, 1000usize); // larger than the 1200 preview cap
+        let mut img = RgbImage::new(w as u32, h as u32);
+        for (x, _y, p) in img.enumerate_pixels_mut() {
+            let v = ((x % 64) as f32 / 64.0 * 255.0) as u8;
+            *p = image::Rgb([v, v / 2, 200]);
+        }
+        let mut s = FilterSettings::default();
+        s.texture = 30.0; // a spatial effect, so the full-res pass runs
+
+        let out = TinyLumaApp::render_full_image(
+            &img,
+            &s,
+            &None,
+            &crate::retouch::RetouchLayer::default(),
+        );
+        assert_eq!(out.len(), w * h * 3, "export must keep the full resolution");
+        assert_ne!(
+            out.as_slice(),
+            img.as_raw().as_slice(),
+            "export must apply the settings at full resolution"
+        );
+    }
+
+    /// The drag tier caps the long side and preserves the aspect ratio.
+    #[test]
+    fn drag_dims_caps_and_preserves_aspect() {
+        assert_eq!(TinyLumaApp::drag_dims(1200, 800), (640, 427));
+        assert_eq!(TinyLumaApp::drag_dims(800, 600), (640, 480));
+        // At or below the cap the size is unchanged (no upscale).
+        assert_eq!(TinyLumaApp::drag_dims(640, 480), (640, 480));
+        assert_eq!(TinyLumaApp::drag_dims(320, 240), (320, 240));
+    }
+
+    /// The drag-tier settings signatures split detail from base — a
+    /// detail change moves the detail signature only, and an effect *amount*
+    /// change moves neither (the effects tail always re-runs).
+    #[test]
+    fn drag_signatures_track_the_right_settings() {
+        let mut a = FilterSettings::default();
+        a.texture = 40.0;
+        a.glow = 30.0;
+
+        let b = a;
+        assert_eq!(
+            TinyLumaApp::drag_detail_signature(&a),
+            TinyLumaApp::drag_detail_signature(&b)
+        );
+        assert_eq!(
+            TinyLumaApp::drag_base_signature(&a, 640, 427),
+            TinyLumaApp::drag_base_signature(&b, 640, 427)
+        );
+
+        // A detail slider change moves the detail signature…
+        let mut b2 = a;
+        b2.texture = 41.0;
+        assert_ne!(
+            TinyLumaApp::drag_detail_signature(&a),
+            TinyLumaApp::drag_detail_signature(&b2)
+        );
+        // …but not the base signature (engagement unchanged).
+        assert_eq!(
+            TinyLumaApp::drag_base_signature(&a, 640, 427),
+            TinyLumaApp::drag_base_signature(&b2, 640, 427)
+        );
+
+        // Tuning an effect amount moves neither signature.
+        let mut c = a;
+        c.glow = 55.0;
+        assert_eq!(
+            TinyLumaApp::drag_detail_signature(&a),
+            TinyLumaApp::drag_detail_signature(&c)
+        );
+        assert_eq!(
+            TinyLumaApp::drag_base_signature(&a, 640, 427),
+            TinyLumaApp::drag_base_signature(&c, 640, 427)
+        );
+
+        // Engaging an effect, or a different resolution, moves the base signature.
+        let mut d = a;
+        d.halation = 25.0;
+        assert_ne!(
+            TinyLumaApp::drag_base_signature(&a, 640, 427),
+            TinyLumaApp::drag_base_signature(&d, 640, 427)
+        );
+        assert_ne!(
+            TinyLumaApp::drag_base_signature(&a, 640, 427),
+            TinyLumaApp::drag_base_signature(&a, 800, 533)
+        );
+    }
+
+    /// The drag-tier downscale averages (identity when unchanged).
+    #[test]
+    fn drag_downscale_matches_average() {
+        // 2x2 → 1x1 averages the four red samples.
+        let src = vec![0u8, 0, 0, 100, 0, 0, 200, 0, 0, 40, 0, 0];
+        let out = TinyLumaApp::downscale_rgb(&src, 2, 2, 1, 1);
+        assert_eq!(out, vec![85u8, 0, 0]); // (0 + 100 + 200 + 40) / 4
+
+        // Identity when the dimensions are unchanged.
+        let same = TinyLumaApp::downscale_rgb(&src, 2, 2, 2, 2);
+        assert_eq!(same, src);
+    }
+
+    /// The proxy long side snaps up to the ladder, is floored at the
+    /// minimum, and caps at the top rung without needing to know the source.
+    #[test]
+    fn proxy_target_long_snaps_to_ladder() {
+        // Below the floor → the first rung.
+        assert_eq!(TinyLumaApp::proxy_target_long(100.0, 0.5, 1.0), 640);
+        // Just above a rung → the next rung.
+        assert_eq!(TinyLumaApp::proxy_target_long(1000.0, 1.0, 1.0), 1280);
+        // Exactly on a rung → that rung.
+        assert_eq!(TinyLumaApp::proxy_target_long(960.0, 1.0, 1.0), 960);
+        // HiDPI raises the target.
+        assert_eq!(TinyLumaApp::proxy_target_long(1000.0, 1.0, 1.5), 1920);
+        // Above the top rung → the top rung.
+        assert_eq!(TinyLumaApp::proxy_target_long(4000.0, 5.0, 1.0), 4096);
+    }
+
+    /// `proxy_dims` never upscales beyond the source, preserves the
+    /// aspect ratio, and tracks viewport / zoom / pixel density.
+    #[test]
+    fn proxy_dims_caps_to_source_and_preserves_aspect() {
+        // Source at/below the fit level is returned unchanged.
+        assert_eq!(
+            TinyLumaApp::proxy_dims(1200, 800, 1000.0, 1.0, 1.0),
+            (1200, 800)
+        );
+        // A large source is downscaled to the viewport bucket (aspect kept).
+        assert_eq!(
+            TinyLumaApp::proxy_dims(4000, 3000, 1000.0, 1.0, 1.0),
+            (1280, 960)
+        );
+        // HiDPI raises the bucket.
+        assert_eq!(
+            TinyLumaApp::proxy_dims(4000, 3000, 1000.0, 1.0, 1.5),
+            (1920, 1440)
+        );
+        // Zooming to 1:1 uses the full source.
+        assert_eq!(
+            TinyLumaApp::proxy_dims(4000, 3000, 1000.0, 4.0, 1.0),
+            (4000, 3000)
+        );
+        // Tiny sources are never upscaled.
+        assert_eq!(
+            TinyLumaApp::proxy_dims(320, 240, 1000.0, 1.0, 1.0),
+            (320, 240)
+        );
+        // A huge source caps at the top rung, not the huge native size.
+        assert_eq!(
+            TinyLumaApp::proxy_dims(8000, 6000, 2000.0, 5.0, 1.0),
+            (4096, 3072)
+        );
     }
 }

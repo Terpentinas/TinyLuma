@@ -197,8 +197,9 @@ fn stroke_geometry(w: usize, h: usize, spot: &Spot, path: &[[f32; 2]]) -> Option
 }
 
 /// Region touched by an op: the dab circle or the stroke capsule, inflated by
-/// the search margin. Shared by the cache and the geometry helpers.
-fn op_rect(w: usize, h: usize, spot: &Spot) -> Option<Rect> {
+/// the search margin. Shared by the cache, the geometry helpers and the
+/// background heal worker (which uses it to compute the upload region).
+pub(crate) fn op_rect(w: usize, h: usize, spot: &Spot) -> Option<Rect> {
     match &spot.path {
         Some(path) => stroke_geometry(w, h, spot, path).map(|g| g.rect),
         None => spot_geometry(w, h, spot).map(|g| g.rect),

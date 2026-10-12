@@ -388,6 +388,8 @@ impl TinyLumaApp {
         let rgb = img.to_rgb8();
         let (w, h) = rgb.dimensions();
 
+        // Export renders from the retouch *layer* (the source of truth), not the
+        // background-healed display buffer, so it never races the heal worker.
         let raw = Self::render_full_image(&rgb, &self.settings, &self.lut_path, &self.retouch.layer);
         // Orientation, then straighten, then crop (the last, non-destructive steps).
         let (raw, w, h) = self.crop.crop.orientation.apply_rgb(&raw, w, h);

@@ -39,6 +39,9 @@ struct PreviewEntry {
     processed: Option<Vec<u8>>,
     state: FilterSettings,
     lut_path: Option<PathBuf>,
+    /// Resolution of `processed`, so a ready render is only served for
+    /// the same proxy resolution (a 1920 proxy must not reuse a 1200 render).
+    render_dims: (usize, usize),
     has_render: bool,
 }
 
@@ -131,6 +134,7 @@ impl PreviewCache {
             processed: None,
             state: FilterSettings::default(),
             lut_path: None,
+            render_dims: (0, 0),
             has_render: false,
         };
         self.bytes += Self::entry_size(&entry);
@@ -139,15 +143,21 @@ impl PreviewCache {
         self.evict();
     }
 
-    /// Ready render, if it is up to date for the given settings and LUT.
+    /// Ready render, if it is up to date for the given settings, LUT and proxy
+    /// resolution (resolution is part of the key).
     pub(crate) fn render(
         &mut self,
         path: &Path,
         state: &FilterSettings,
         lut_path: &Option<PathBuf>,
+        dims: (usize, usize),
     ) -> Option<Vec<u8>> {
         let entry = self.map.get(path)?;
-        if entry.has_render && &entry.state == state && &entry.lut_path == lut_path {
+        if entry.has_render
+            && &entry.state == state
+            && &entry.lut_path == lut_path
+            && entry.render_dims == dims
+        {
             let processed = entry.processed.clone()?;
             self.touch(path);
             Some(processed)
@@ -156,12 +166,13 @@ impl PreviewCache {
         }
     }
 
-    /// Store the ready render for the current settings.
+    /// Store the ready render for the current settings and proxy resolution.
     pub(crate) fn store_render(
         &mut self,
         path: &Path,
         state: FilterSettings,
         lut_path: Option<PathBuf>,
+        dims: (usize, usize),
         processed: Vec<u8>,
     ) {
         if let Some(entry) = self.map.get_mut(path) {
@@ -169,6 +180,7 @@ impl PreviewCache {
             entry.processed = Some(processed);
             entry.state = state;
             entry.lut_path = lut_path;
+            entry.render_dims = dims;
             entry.has_render = true;
             let new = Self::entry_size(entry);
             self.bytes = self.bytes.saturating_sub(old).saturating_add(new);
@@ -276,6 +288,13 @@ impl TinyLumaApp {
         self.tools_rect = None;
         self.thumbnails.clear();
         self.preview_cache.clear();
+        // Drop the higher-res source and any in-flight decode.
+        self.unload_proxy_source();
+        // Cancel any in-flight background proxy render.
+        self.invalidate_proxy_render();
+        self.proxy_dims = (0, 0);
+        self.desired_proxy = (0, 0);
+        self.proxy_rebuild_now = false;
         self.thumb_rx = None;
         self.thumb_tx = None;
         self.prefetch.stop.store(true, AtomicOrdering::Relaxed);
@@ -639,10 +658,23 @@ impl TinyLumaApp {
         // the fresh entry could evict itself.
         self.preview_cache.set_pinned(Some(path.clone()));
 
-        // --- 1. IMAGE PREPARATION (1200px) ---
-        // First try the LRU cache — returning to a recent frame without decode+resize.
+        // --- 1. IMAGE PREPARATION (1200px fit bucket) ---
+        // Instant path: the LRU decoded frame; else the already-loaded higher-res
+        // source (downscaled — no second decode, ); else decode+resize.
         let resized_rgb = if let Some(cached) = self.preview_cache.base(&path) {
             cached
+        } else if let Some(source) = self
+            .proxy_source
+            .as_ref()
+            .filter(|_| self.proxy_source_path.as_deref() == Some(path.as_path()))
+        {
+            let (w, h) = (source.width() as usize, source.height() as usize);
+            let (dw, dh) = TinyLumaApp::proxy_dims_for_long(w, h, 1200);
+            let raw = TinyLumaApp::downscale_rgb(source.as_raw(), w, h, dw, dh);
+            let rgb = RgbImage::from_raw(dw as u32, dh as u32, raw)
+                .expect("downscale_rgb returns dw*dh*3 bytes");
+            self.preview_cache.insert_base(path.clone(), rgb.clone());
+            rgb
         } else {
             let Ok(img) = image::open(&path) else {
                 return;
@@ -668,6 +700,13 @@ impl TinyLumaApp {
         // --- 2. APPLICATION DATA UPDATE ---
         self.preview_base = Some(resized_rgb);
         self.image_path = Some(path.clone());
+        // The working proxy and its viewport target both start at the
+        // 1200 fit bucket; the target is re-derived from the viewport each frame.
+        self.proxy_dims = (rw_u, rh_u);
+        self.desired_proxy = (rw_u, rh_u);
+        // Start the higher-res source decode in the background; when it
+        // lands, the proxy is upgraded to the viewport bucket (`poll_proxy_source`).
+        self.request_proxy_source(ctx, Some(&path));
         self.texture = None;
         self.original_texture = None;
         self.is_panning = false;
@@ -688,7 +727,7 @@ impl TinyLumaApp {
         // --- 4. READY RENDER FROM CACHE OR RECOMPUTE ---
         if let Some(processed) = self
             .preview_cache
-            .render(&path, &self.settings, &self.lut_path)
+            .render(&path, &self.settings, &self.lut_path, (rw_u, rh_u))
         {
             // Settings/LUT unchanged since the last render — take the ready one.
             self.processed_pixels = processed;
@@ -703,6 +742,9 @@ impl TinyLumaApp {
             self.clarity_cache_valid = false;
             self.spatial_base_valid = false;
             self.combined_lut = None;
+            // The ready render replaced `processed_pixels`: mark it changed so the
+            // histogram (and display key) refreshes.
+            self.processed_revision = self.processed_revision.wrapping_add(1);
             self.upload_preview_textures(ctx);
         } else {
             self.color_buffer = raw.clone();
@@ -825,6 +867,93 @@ impl TinyLumaApp {
             }
         }
         ctx.request_repaint();
+    }
+
+    /// Requests the higher-res decoded source for the current image.
+    ///
+    /// Decoding and the cap resize run on a background thread, so the UI never
+    /// blocks; the reply is applied by [`Self::poll_proxy_source`]. A no-op when
+    /// the source for `path` is already loaded or loading. Passing `None` unloads.
+    pub(crate) fn request_proxy_source(&mut self, ctx: &egui::Context, path: Option<&Path>) {
+        let Some(path) = path else {
+            self.unload_proxy_source();
+            return;
+        };
+        // Already have (or are loading) this frame's source — keep it.
+        if self.proxy_source_path.as_deref() == Some(path)
+            && (self.proxy_source.is_some() || self.proxy_loading)
+        {
+            return;
+        }
+        self.unload_proxy_source();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(PathBuf, RgbImage)>(1);
+        self.proxy_source_rx = Some(rx);
+        self.proxy_loading = true;
+        self.proxy_source_path = Some(path.to_path_buf());
+
+        let path_buf = path.to_path_buf();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let Ok(img) = image::open(&path_buf) else {
+                return;
+            };
+            let (w, h) = img.dimensions();
+            // Cap the source at SOURCE_WORK_MAX on the long side (never upscale).
+            let max_dim = crate::app::processing::SOURCE_WORK_MAX as f32;
+            let scale = (max_dim / w.max(h) as f32).min(1.0);
+            let source = if scale < 1.0 {
+                img.resize(
+                    (w as f32 * scale) as u32,
+                    (h as f32 * scale) as u32,
+                    image::imageops::FilterType::Triangle,
+                )
+                .to_rgb8()
+            } else {
+                img.to_rgb8()
+            };
+            let _ = tx.send((path_buf, source));
+            // Wake the UI so the reply is applied promptly.
+            ctx.request_repaint();
+        });
+    }
+
+    /// Applies a finished background source decode. A stale reply (the
+    /// user opened a different frame meanwhile) is discarded.
+    pub(crate) fn poll_proxy_source(&mut self, ctx: &egui::Context) {
+        let received = self
+            .proxy_source_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        let Some((path, source)) = received else {
+            return;
+        };
+        self.proxy_loading = false;
+        if self.image_path.as_deref() != Some(path.as_path()) {
+            // The user moved on — drop the stale source.
+            self.proxy_source = None;
+            self.proxy_source_path = None;
+            return;
+        }
+        self.proxy_source = Some(Arc::new(source));
+        self.proxy_source_path = Some(path);
+        // A ready higher-res source upgrades the proxy at the next rebuild.
+        self.proxy_rebuild_now = true;
+        ctx.request_repaint();
+    }
+
+    /// Drops the higher-res source and any in-flight decode.
+    pub(crate) fn unload_proxy_source(&mut self) {
+        self.proxy_source = None;
+        self.proxy_source_path = None;
+        self.proxy_source_rx = None;
+        self.proxy_loading = false;
+    }
+
+    /// Dimensions of the loaded higher-res source, if any.
+    pub(crate) fn proxy_source_dims(&self) -> Option<(usize, usize)> {
+        self.proxy_source
+            .as_ref()
+            .map(|s| (s.width() as usize, s.height() as usize))
     }
 
     /// Drains background batch export events and updates progress.

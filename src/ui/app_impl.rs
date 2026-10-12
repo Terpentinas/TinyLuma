@@ -37,6 +37,11 @@ impl eframe::App for TinyLumaApp {
         // if at least one slider is active
         self.drag_active = false;
 
+        // Apply any finished background heal jobs and retry a
+        // coalesced one. Non-blocking; runs before the pipeline so a healed
+        // result is uploaded on the same frame it arrives.
+        self.poll_heal();
+
         // Drag-drop: we support multiple files AND folders.
         let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -222,6 +227,10 @@ impl eframe::App for TinyLumaApp {
         // Drain the finished thumbnails from the background thread (filmstrip)
         self.poll_thumbnails(ctx);
         self.poll_prefetch(ctx);
+        // Apply a finished higher-res source decode (drives the proxy).
+        self.poll_proxy_source(ctx);
+        // Install a finished background proxy render (debounced rebuild).
+        self.poll_proxy_render(ctx);
         self.poll_export(ctx);
 
         // State at the start of the frame (AFTER undo/redo) — the base for the history entry.

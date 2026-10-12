@@ -53,6 +53,10 @@ impl TinyLumaApp {
 
                 let avail = ui.available_size();
 
+                // Derive the viewport proxy target (applied by the
+                // debounced rebuild in `process_preview` on the next frame).
+                self.update_proxy_target(ctx, avail.x.max(avail.y), ctx.pixels_per_point());
+
                 // Exact block heights (with item_spacing.y == 0 they simply add up).
                 const BUTTONS_H: f32 = 36.0; // 6(line) + 2 + button(26) + 2
                 let filmstrip_h = if has_multi {

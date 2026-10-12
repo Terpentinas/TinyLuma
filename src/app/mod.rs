@@ -25,6 +25,8 @@ pub(crate) mod clipping;
 pub(crate) mod crop;
 pub(crate) mod retouch;
 pub(crate) mod persist;
+pub(crate) mod heal_job;
+pub(crate) mod proxy_job;
 #[cfg(test)]
 mod calibration;
 #[cfg(test)]
@@ -59,6 +61,18 @@ pub(crate) struct TinyLumaApp {
     /// The clipping overlay actually baked into the display texture, so a toggle
     /// re-uploads only when it changes.
     pub(crate) clip_overlay_applied: clipping::ClipOverlay,
+    /// Revision of `processed_pixels`, bumped whenever it is (re)built.
+    pub(crate) processed_revision: u64,
+    /// Revision the output histogram was last built from.
+    pub(crate) histogram_revision: u64,
+    /// Identity of the preview base last uploaded into `original_texture`
+    /// (path + size), so an unchanged base is not re-uploaded.
+    pub(crate) upload_orig_key: Option<(PathBuf, u32, u32)>,
+    /// Identity of the last display upload
+    /// `(processed revision, width, height, overlay)`, so unchanged frames are skipped.
+    pub(crate) upload_display_key: Option<(u64, u32, u32, clipping::ClipOverlay)>,
+    /// Reusable scratch for the clipping-warning overlay (avoids a clone).
+    pub(crate) scratch_clip: Vec<u8>,
     pub(crate) luma_cache: Vec<f32>,      // luma cache for spatial_pass (avoids reallocation)
     pub(crate) luma_cache_valid: bool,    // flag: is the luma_cache up to date?
     pub(crate) clarity_cache: Vec<f32>,   // blurred-map cache for Clarity (bilateral base)
@@ -69,6 +83,14 @@ pub(crate) struct TinyLumaApp {
     /// Reused until color/dehaze/frame size changes.
     pub(crate) spatial_base: processing::SpatialBase,
     pub(crate) spatial_base_valid: bool,
+    /// Reduced-resolution interactive drag tier — the spatial pass runs
+    /// on a downscaled input while a slider is dragged. Buffers are keyed by the
+    /// input revision, the drag resolution and a settings signature, so an
+    /// effects-only drag reuses the cached detail head.
+    pub(crate) drag_tier: processing::DragTier,
+    /// Bumped whenever the spatial *input* (the color or dehaze buffer)
+    /// changes, so the drag-tier caches can be invalidated precisely.
+    pub(crate) spatial_input_revision: u64,
     pub(crate) texture: Option<egui::TextureHandle>,
     pub(crate) color_dirty: bool,
     pub(crate) spatial_dirty: bool,
@@ -102,6 +124,35 @@ pub(crate) struct TinyLumaApp {
     pub(crate) prefetch_rx: Option<std::sync::mpsc::Receiver<(PathBuf, RgbImage)>>,
     /// Background prefetch control (current index + stop signal).
     pub(crate) prefetch: Arc<image_io::PrefetchControl>,
+    /// Higher-res decoded source for the current image (single slot,
+    /// long side ≤ `SOURCE_WORK_MAX`). Loaded on a background thread and used to
+    /// derive the viewport proxy (`preview_base`); dropped on frame switch / close
+    /// so memory stays bounded. See `image_io::request_proxy_source`.
+    pub(crate) proxy_source: Option<Arc<RgbImage>>,
+    /// Path `proxy_source` belongs to (so the same frame is not reloaded).
+    pub(crate) proxy_source_path: Option<PathBuf>,
+    /// Receiver for the background source decode.
+    pub(crate) proxy_source_rx: Option<std::sync::mpsc::Receiver<(PathBuf, RgbImage)>>,
+    /// A background source decode is in flight.
+    pub(crate) proxy_loading: bool,
+    /// Resolution currently held by `preview_base` (the working proxy).
+    /// A change invalidates the resolution-implicit pipeline caches.
+    pub(crate) proxy_dims: (usize, usize),
+    /// Viewport-derived resolution the proxy should be rebuilt to.
+    pub(crate) desired_proxy: (usize, usize),
+    /// When `desired_proxy` last changed (rebuild debounce).
+    pub(crate) proxy_change_time: Instant,
+    /// Rebuild the proxy at the next opportunity (e.g. the source just
+    /// arrived, or the desired resolution was never realized).
+    pub(crate) proxy_rebuild_now: bool,
+    /// Background proxy-render worker (debounced viewport rebuild).
+    /// Lazily spawned; at most one job is in flight and jobs coalesce by revision.
+    pub(crate) proxy_worker: Option<proxy_job::ProxyWorker>,
+    /// Monotonically increasing proxy-render revision (coalescing key).
+    pub(crate) proxy_job_revision: u64,
+    /// Target of the proxy-render job currently in flight, if any, so
+    /// the same target is not enqueued twice.
+    pub(crate) proxy_pending_target: Option<(usize, usize)>,
     /// Whether the filmstrip should scroll to the current image (once after switching).
     pub(crate) filmstrip_needs_scroll: bool,
     pub(crate) split_position: f32,
@@ -587,6 +638,18 @@ impl TinyLumaApp {
         let (last_session_folder, last_session_edits) =
             Self::load_last_session(saved.last_session_folder.clone());
 
+        Self::from_parts(saved, lut_lib, last_session_folder, last_session_edits)
+    }
+
+    /// Builds the app from a resolved save-settings snapshot and LUT library.
+    /// Shared by [`Self::new`] and the test-only [`Self::new_headless`] so the
+    /// ~100-field initialisation cannot drift between the two entry points.
+    fn from_parts(
+        saved: crate::settings::SaveSettings,
+        lut_lib: LutLibrary,
+        last_session_folder: Option<PathBuf>,
+        last_session_edits: usize,
+    ) -> Self {
         Self {
             settings: FilterSettings::default(),
             image_path: None,
@@ -603,6 +666,11 @@ impl TinyLumaApp {
             histogram_display_path: None,
             clipping: clipping::ClippingView::default(),
             clip_overlay_applied: clipping::ClipOverlay::NONE,
+            processed_revision: 0,
+            histogram_revision: u64::MAX,
+            upload_orig_key: None,
+            upload_display_key: None,
+            scratch_clip: Vec::new(),
             luma_cache: Vec::new(),
             luma_cache_valid: false,
             clarity_cache: Vec::new(),
@@ -611,6 +679,8 @@ impl TinyLumaApp {
             clarity_cache_valid: false,
             spatial_base: processing::SpatialBase::default(),
             spatial_base_valid: false,
+            drag_tier: processing::DragTier::default(),
+            spatial_input_revision: 0,
             texture: None,
             color_dirty: false,
             spatial_dirty: false,
@@ -635,6 +705,17 @@ impl TinyLumaApp {
             thumb_tx: None,
             prefetch_rx: None,
             prefetch: Arc::new(image_io::PrefetchControl::new()),
+            proxy_source: None,
+            proxy_source_path: None,
+            proxy_source_rx: None,
+            proxy_loading: false,
+            proxy_dims: (0, 0),
+            desired_proxy: (0, 0),
+            proxy_change_time: Instant::now(),
+            proxy_rebuild_now: false,
+            proxy_worker: None,
+            proxy_job_revision: 0,
+            proxy_pending_target: None,
             filmstrip_needs_scroll: false,
             original_texture: None,
             is_dragging_split: false,
@@ -715,5 +796,19 @@ impl TinyLumaApp {
             batch_use_current_settings: true,
             batch_apply_only_untouched: false,
         }
+    }
+
+    /// Test-only headless constructor: default save settings, an empty LUT
+    /// library and no filesystem access (no config read, no LUT scan). Used by the
+    /// stateful resolution-swap regression test, which drives `process_preview`
+    /// across two working resolutions.
+    #[cfg(test)]
+    pub(crate) fn new_headless() -> Self {
+        Self::from_parts(
+            crate::settings::SaveSettings::default(),
+            LutLibrary::new(),
+            None,
+            0,
+        )
     }
 }
